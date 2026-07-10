@@ -1822,7 +1822,7 @@
 <div id="fc-batch-loading"><div class="fc-spinner"></div><div class="fc-loading-text">数据加载中...</div></div>\
 <div id="fc-batch-header">\
 <div class="fc-header-row">\
-<h2>FutKit辅助工具 v2.0.0</h2>\
+<h2>FutKit-批量进化工具</h2>\
 <div class="fc-header-spacer"></div>\
 <button class="fc-btn fc-btn-gray fc-btn-sm" id="fc-batch-close">✕</button>\
 </div>\
@@ -1960,7 +1960,7 @@
         renderGroupConfig();
         renderSummary();
 
-        log("FutKit辅助工具 v2.0.0 已就绪", "ok");
+        log("FutKit-批量进化工具 已就绪", "ok");
 
         // 匿名统计上报
         (function () {
@@ -1988,32 +1988,39 @@
             var listEl = document.querySelector('[class*="ut-academy-hub-view--list"]');
             if (!listEl) return;
 
-            // Insert position: find the bottom action area, or use listEl itself
-            // Look for a flex-center wrapper that FC Enhancer also targets
-            var insertParent = listEl.querySelector('[class*="fn:justify-end"]') || listEl.querySelector('[class*="fn:justify-center"]');
-            if (!insertParent) {
-                // Create our own wrapper at the bottom of the list
-                insertParent = document.createElement("div");
-                insertParent.className = "fn:flex fn:w-full fn:justify-end";
-                insertParent.style.cssText = "margin:12px 0;";
-                listEl.appendChild(insertParent);
-            }
+            // Create wrapper at the bottom-right of the list
+            var insertParent = document.createElement("div");
+            insertParent.style.cssText = "display:flex;justify-content:flex-end;width:100%;margin:12px 0;";
+            listEl.appendChild(insertParent);
 
-            // Button group container (matching FC Enhancer's structure)
-            var btnGroup = document.createElement("div");
-            btnGroup.className = "fn:flex fn:flex-col fn:items-center fn:gap-2";
+            // Create the button with all-inline styles (no dependency on external CSS)
             var ourBtn = document.createElement("button");
             ourBtn.id = "fc-academy-btn";
             ourBtn.type = "button";
-            // Match EA button styling
-            ourBtn.className = "fn:group/button fn:inline-flex fn:shrink-0 fn:items-center fn:justify-center fn:rounded-lg fn:border fn:border-transparent fn:bg-clip-padding fn:text-sm fn:font-medium fn:whitespace-nowrap fn:transition-all fn:outline-none fn:select-none fn:h-8 fn:gap-1.5 fn:px-2.5";
-            ourBtn.style.cssText = "background:linear-gradient(135deg,#3b82f6,#06b6d4);color:#fff;cursor:pointer;";
             ourBtn.textContent = "批量进化工具";
-            btnGroup.appendChild(ourBtn);
-            insertParent.appendChild(btnGroup);
+            ourBtn.style.cssText =
+                "display:inline-flex;align-items:center;justify-content:center;" +
+                "height:32px;padding:0 16px;border:none;border-radius:8px;" +
+                "background:linear-gradient(135deg,#3b82f6,#06b6d4);color:#fff;" +
+                "font-size:13px;font-weight:600;white-space:nowrap;cursor:pointer;" +
+                "box-shadow:0 2px 8px rgba(59,130,246,0.3);" +
+                "transition:transform 0.15s,box-shadow 0.15s;" +
+                "-webkit-tap-highlight-color:transparent;" +
+                "user-select:none;outline:none;";
+            insertParent.appendChild(ourBtn);
 
-            // Click handler
-            ourBtn.addEventListener("click", function () {
+            // Hover effect
+            ourBtn.addEventListener("mouseenter", function () {
+                ourBtn.style.transform = "translateY(-1px)";
+                ourBtn.style.boxShadow = "0 4px 14px rgba(59,130,246,0.45)";
+            });
+            ourBtn.addEventListener("mouseleave", function () {
+                ourBtn.style.transform = "";
+                ourBtn.style.boxShadow = "0 2px 8px rgba(59,130,246,0.3)";
+            });
+
+            // Click/tap handler
+            function openTool() {
                 var ov = $("fc-batch-overlay");
                 if (ov) {
                     ov.classList.toggle("show");
@@ -2021,6 +2028,11 @@
                         setTimeout(doFullDataLoad, 300);
                     }
                 }
+            }
+            ourBtn.addEventListener("click", openTool);
+            ourBtn.addEventListener("touchend", function (e) {
+                e.preventDefault();
+                openTool();
             });
 
         }
