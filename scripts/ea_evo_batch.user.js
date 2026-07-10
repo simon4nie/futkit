@@ -340,34 +340,53 @@
 
                     if (playerCount === 0) { resolve([]); return; }
 
-                    // Load all players via Club.search() for enriched data (names, _staticData, etc.)
                     var allItems = [];
-                    var criteria = new uw.UTSearchCriteriaDTO();
-                    criteria.type = "player";
-                    criteria.sortBy = "ovr";
-                    criteria.sort = "desc";
-                    criteria.count = 200;
-                    criteria.offset = 0;
-                    criteria.searchAltPositions = true;
+                    var seenIds = {};
+                    var PAGE_SIZE = 200;
 
-                    Club.search(criteria).observe(controller, function _onPage(p, pt) {
-                        p.unobserve(controller);
-                        if (pt.success && pt.response) {
-                            var items = pt.response.items || pt.response.itemData || [];
-                            if (items.length > 0) {
-                                allItems = items;
-                                log("全部球员加载完成: " + allItems.length + " 人", "ok");
+                    function loadPage(offset) {
+                        var criteria = new uw.UTSearchCriteriaDTO();
+                        criteria.type = "player";
+                        criteria.sortBy = "ovr";
+                        criteria.sort = "desc";
+                        criteria.count = PAGE_SIZE;
+                        criteria.offset = offset;
+                        criteria.searchAltPositions = true;
+
+                        Club.search(criteria).observe(controller, function _onPage(p, pt) {
+                            p.unobserve(controller);
+                            if (pt.success && pt.response) {
+                                var items = pt.response.items || pt.response.itemData || [];
+                                var newCount = 0;
                                 if (items.length > 0) {
-                                    var firstKeys = Object.keys(items[0]).sort().join(", ");
-                                    var hasAA = items[0].hasOwnProperty("academyAttributes");
+                                    if (allItems.length === 0) {
+                                        var f = items[0];
+                                        var sd = f._staticData || {};
+                                        log("  首条: id=" + f.id + " rf=" + f.rareflag + " pos=" + f.preferredPosition + " rating=" + f.rating + " name=" + (sd.name || f.name || "?"), "info");
+                                    }
+                                    items.forEach(function (it) {
+                                        if (!seenIds[it.id]) {
+                                            seenIds[it.id] = true;
+                                            allItems.push(it);
+                                            newCount++;
+                                        }
+                                    });
                                 }
+                                log("  第" + (offset / PAGE_SIZE + 1) + "页: " + items.length + " 条, 新增 " + newCount + " (累计 " + allItems.length + "/" + playerCount + ")", "info");
+                                if (allItems.length < playerCount && offset < playerCount) {
+                                    loadPage(offset + PAGE_SIZE);
+                                } else {
+                                    log("全部球员加载完成: " + allItems.length + " 人 (去重后)", "ok");
+                                    enrichAcademyAttributes(allItems).then(function () { resolve(allItems); });
+                                }
+                            } else {
+                                log("  第" + (offset / PAGE_SIZE + 1) + "页请求失败", "warn");
+                                resolve(allItems);
                             }
-                        } else {
-                            log("  search: success=" + pt.success, "warn");
-                        }
-                        // Enrich with academyAttributes from direct API if missing
-                        enrichAcademyAttributes(allItems).then(function () { resolve(allItems); });
-                    });
+                        });
+                    }
+
+                    loadPage(0);
                 });
             } catch (e) {
                 reject(new Error("loadClubPlayers: " + e.message));
@@ -383,42 +402,57 @@
         if (!sid) return Promise.resolve();
 
         return new Promise(function (resolve) {
-            var body = JSON.stringify({
-                count: 200, start: 0,
-                sortBy: "ovr", sort: "desc", type: "player",
-                searchAltPositions: true
-            });
-            GM_xmlhttpRequest({
-                method: "POST",
-                url: EA + GAME + "/club",
-                headers: { "Content-Type": "application/json", "X-UT-SID": sid },
-                data: body, timeout: 30000,
-                onload: function (r) {
-                    if (r.status !== 200) { log("  enrich API HTTP " + r.status, "warn"); resolve(); return; }
-                    try {
-                        var resp = JSON.parse(r.responseText);
-                        var rawItems = resp.items || resp.itemData || [];
-                        // Build id → academyAttributes map
-                        var aaMap = {};
-                        rawItems.forEach(function (it) {
-                            if (it.academyAttributes && it.academyAttributes.length > 0) {
-                                aaMap[it.id] = it.academyAttributes;
+            var PAGE_SIZE = 200;
+            var allRawItems = [];
+
+            function fetchPage(start) {
+                var body = JSON.stringify({
+                    count: PAGE_SIZE, start: start,
+                    sortBy: "ovr", sort: "desc", type: "player",
+                    searchAltPositions: true
+                });
+                GM_xmlhttpRequest({
+                    method: "POST",
+                    url: EA + GAME + "/club",
+                    headers: { "Content-Type": "application/json", "X-UT-SID": sid },
+                    data: body, timeout: 30000,
+                    onload: function (r) {
+                        if (r.status !== 200) { log("  enrich HTTP " + r.status, "warn"); finish(); return; }
+                        try {
+                            var resp = JSON.parse(r.responseText);
+                            var items = resp.items || resp.itemData || [];
+                            allRawItems = allRawItems.concat(items);
+                            if (items.length >= PAGE_SIZE) {
+                                fetchPage(start + PAGE_SIZE);
+                            } else {
+                                finish();
                             }
-                        });
-                        var enriched = 0;
-                        allItems.forEach(function (it) {
-                            if (aaMap[it.id]) {
-                                it.academyAttributes = aaMap[it.id];
-                                enriched++;
-                            }
-                        });
-                        log("已补充 " + enriched + " 名球员的 已进化特技", "ok");
-                    } catch (e) { log("  enrich 解析失败: " + e.message, "warn"); }
-                    resolve();
-                },
-                onerror: function () { log("  enrich API 网络错误", "warn"); resolve(); },
-                ontimeout: function () { log("  enrich API 超时", "warn"); resolve(); }
-            });
+                        } catch (e) { log("  enrich 解析失败: " + e.message, "warn"); finish(); }
+                    },
+                    onerror: function () { log("  enrich 网络错误", "warn"); finish(); },
+                    ontimeout: function () { log("  enrich 超时", "warn"); finish(); }
+                });
+            }
+
+            function finish() {
+                var aaMap = {};
+                allRawItems.forEach(function (it) {
+                    if (it.academyAttributes && it.academyAttributes.length > 0) {
+                        aaMap[it.id] = it.academyAttributes;
+                    }
+                });
+                var enriched = 0;
+                allItems.forEach(function (it) {
+                    if (aaMap[it.id]) {
+                        it.academyAttributes = aaMap[it.id];
+                        enriched++;
+                    }
+                });
+                log("已补充 " + enriched + " 名球员的 已进化特技（共扫描 " + allRawItems.length + " 人）", "ok");
+                resolve();
+            }
+
+            fetchPage(0);
         });
     }
 
@@ -441,7 +475,7 @@
 
         filtered.forEach(function (it) {
             var code = it.preferredPosition;
-            var posName = posCodeToName(code);
+            var posName = (typeof code === "string") ? code : posCodeToName(code);
             var gp = null;
             for (var i = 0; i < POS_GROUPS.length; i++) {
                 if (POS_GROUPS[i].positions.indexOf(posName) !== -1) { gp = POS_GROUPS[i].name; break; }
@@ -477,7 +511,7 @@
                 guidAssetId: guidAssetId,
                 iconId: it.iconId || it.headshotId || it.headshotAssetId || null,
                 rating: it.rating || it._rating,
-                position: posCodeToName(it.preferredPosition),
+                position: (typeof it.preferredPosition === "string") ? it.preferredPosition : posCodeToName(it.preferredPosition),
                 rf: it.rareflag,
                 academyAttributes: filteredAttrs,
                 name: resolvedName,
@@ -501,8 +535,8 @@
 
     function loadPlayerNames() {
         var needNames = players.filter(function (p) { return !p.name || p.name === ""; });
-        // Always try to enrich with guidAssetId from repos, even if names are OK
         var needGuid = players.filter(function (p) { return !p.guidAssetId; });
+        log("解析名称头像: 缺名字 " + needNames.length + " 人, 缺头像 " + needGuid.length + " 人, 总 " + players.length + " 人", "info");
 
         try {
             var uw = unsafeWindow;
@@ -511,11 +545,12 @@
             // Approach 1: repos.Item.staticData — get guidAssetId + names
             if (repos && repos.Item && repos.Item.staticData && typeof repos.Item.staticData.get === "function") {
                 var sdRepo = repos.Item.staticData;
-                var nameCount = 0, iconCount = 0, guidCount = 0;
+                var nameCount = 0, iconCount = 0, guidCount = 0, hitCount = 0;
                 players.forEach(function (p) {
                     try {
                         var d = sdRepo.get(p.resourceId) || sdRepo.get(p.id);
                         if (d) {
+                            hitCount++;
                             var n = d.name || d.knownAs || "";
                             if (!n && d.firstName) n = d.lastName ? (d.lastName + " " + d.firstName) : d.firstName;
                             if (n && (!p.name || p.name === "")) { p.name = n; nameCount++; }
@@ -526,7 +561,8 @@
                         }
                     } catch (e2) {}
                 });
-                if (nameCount >= needNames.length && needGuid.length === 0) return Promise.resolve();
+                log("  staticData: " + hitCount + " 命中, " + nameCount + " 名字, " + guidCount + " 头像", "info");
+                if (nameCount >= needNames.length && needGuid.length === 0) { log("名称头像解析完成", "ok"); return Promise.resolve(); }
             }
 
             // Approach 2: repositories.Item.club items — try to get names from club items
@@ -537,6 +573,7 @@
                     if (vals) {
                         var arr = [];
                         if (typeof Symbol !== "undefined" && vals[Symbol.iterator]) arr = Array.from(vals);
+                        log("  club items: " + arr.length + " 条", "info");
                         if (arr.length > 0) {
                             var nameMap = {};
                             arr.forEach(function (item) {
@@ -548,8 +585,9 @@
                             needNames.forEach(function (p) {
                                 if (nameMap[p.id]) { p.name = nameMap[p.id]; fromPage++; }
                             });
+                            log("  club items 匹配名字: " + fromPage + "/" + needNames.length, "info");
                             if (fromPage > 0) {
-                                if (fromPage >= needNames.length) return Promise.resolve();
+                                if (fromPage >= needNames.length) { log("名称头像解析完成(club)", "ok"); return Promise.resolve(); }
                             }
                         }
                     }
