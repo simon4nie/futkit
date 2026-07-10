@@ -968,7 +968,7 @@
                 locked: [],
                 exclusive: exclusive,
                 maxSlots: MAX_GOLD,
-                label: "🏅 " + activeTab + " 金特技",
+                label: activeTab + " 金特技",
             };
         }
         if (ddType === "group-silver") {
@@ -983,7 +983,7 @@
                 locked: [],
                 exclusive: exclusive,
                 maxSlots: MAX_SILVER,
-                label: "🥈 " + activeTab + " 银特技",
+                label: activeTab + " 银特技",
             };
         }
 
@@ -1032,14 +1032,13 @@
         });
 
         var displayName = p.name || ("#" + p.resourceId);
-        var icon = isGold ? "🏅" : "🥈";
         return {
             slots: slots,
             selected: selected,
             locked: lockedIds,
             exclusive: exclusiveIds,
             maxSlots: effectiveMax,
-            label: icon + " " + displayName + " " + (isGold ? "金" : "银") + "特技",
+            label: displayName + " " + (isGold ? "金" : "银") + "特技",
         };
     }
 
@@ -1114,20 +1113,30 @@
         var closeBtn = $("fc-dd-close");
         if (closeBtn) closeBtn.addEventListener("click", function (e) { e.stopPropagation(); closeDropdown(); });
 
-        // Position near the trigger button (find by data-dd type, not just .active)
+        // Position near the trigger button
         setTimeout(function () {
             var anchor = document.querySelector('[data-dd="' + ddType + '"]');
             if (!anchor) anchor = document.querySelector(".fc-dd-trigger.active");
             if (anchor) {
                 var rect = anchor.getBoundingClientRect();
-                var ddH = dd.offsetHeight;
+                var ddH = Math.min(dd.offsetHeight, 360);
                 var spaceBelow = window.innerHeight - rect.bottom;
-                if (spaceBelow < ddH + 8 && rect.top > ddH + 8) {
-                    dd.style.top = (rect.top - ddH - 4) + "px";
-                } else {
+                var spaceAbove = rect.top;
+                var maxH;
+                if (spaceBelow >= ddH + 8) {
                     dd.style.top = (rect.bottom + 4) + "px";
+                    maxH = spaceBelow - 8;
+                } else if (spaceAbove >= 160) {
+                    var top = rect.top - ddH - 4;
+                    if (top < 4) top = 4;
+                    dd.style.top = top + "px";
+                    maxH = spaceAbove - 8;
+                } else {
+                    dd.style.top = Math.max(4, (window.innerHeight - ddH) / 2) + "px";
+                    maxH = window.innerHeight - 16;
                 }
-                dd.style.left = Math.min(rect.left, window.innerWidth - 260) + "px";
+                dd.style.maxHeight = Math.min(maxH, 360) + "px";
+                dd.style.left = Math.min(Math.max(rect.left, 4), window.innerWidth - dd.offsetWidth - 4) + "px";
             }
         }, 10);
     }
@@ -1151,6 +1160,7 @@
             } else {
                 groupGoldPs[activeTab].push(sid);
             }
+            groupApplied[activeTab] = false;
             saveConfigToStorage();
             renderDropdown();
             renderGroupConfig();
@@ -1161,6 +1171,7 @@
             } else {
                 groupSilverPs[activeTab].push(sid);
             }
+            groupApplied[activeTab] = false;
             saveConfigToStorage();
             renderDropdown();
             renderGroupConfig();
@@ -1468,9 +1479,9 @@
             // Row 2: per-player gold + silver dropdowns
             h += '<div class="fc-player-dd-row">';
             h += '<button class="fc-dd-trigger fc-dd-trigger-sm" data-dd="player-' + p.id + '-gold">' +
-                '🏅 金 (' + (existingGold + pGold.length) + '/' + MAX_GOLD + ') ▼</button>';
+                '金 (' + (existingGold + pGold.length) + '/' + MAX_GOLD + ') ▼</button>';
             h += '<button class="fc-dd-trigger fc-dd-trigger-sm" data-dd="player-' + p.id + '-silver">' +
-                '🥈 银 (' + (existingSilver + pSilver.length) + '/' + MAX_SILVER + ') ▼</button>';
+                '银 (' + (existingSilver + pSilver.length) + '/' + MAX_SILVER + ') ▼</button>';
             h += '</div>';
 
             // Row 3: trait icons — show PNG icon, fallback to Chinese name on error
@@ -1837,6 +1848,7 @@
 .fc-dd-close{cursor:pointer;color:#888;font-size:14px;line-height:1;padding:2px 4px;border-radius:3px;}\
 .fc-dd-close:hover{color:#fff;background:rgba(255,255,255,0.1);}\
 .fc-dd-list{padding:4px;display:flex;flex-wrap:wrap;}\
+@media (max-width:600px){.fc-dropdown{max-width:calc(100vw - 16px);min-width:auto;}.fc-dd-list{display:grid;grid-template-columns:1fr 1fr;}.fc-dd-item{overflow:hidden;text-overflow:ellipsis;}}\
 .fc-dd-item{display:inline-flex;align-items:center;gap:4px;padding:3px 7px;font-size:11px;cursor:pointer;user-select:none;transition:background 0.1s;border-radius:3px;white-space:nowrap;}\
 .fc-dd-item:hover{background:rgba(59,130,246,0.08);}\
 .fc-dd-item.selected{color:#f59e0b;}\
