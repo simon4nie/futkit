@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EA FC 26 金银特技批量进化工具
 // @namespace    futkit
-// @version      1.0.1
+// @version      1.0.2
 // @description  EA FC 26 — 批量金银特技进化 (下拉多选 + 分组模板 + 个人微调)
 // @author       PolarSpark
 // @match        https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*
