@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EA FC 26 金银特技批量进化工具
 // @namespace    futkit
-// @version      1.0.0
+// @version      1.0.1
 // @description  EA FC 26 — 批量金银特技进化 (下拉多选 + 分组模板 + 个人微调)
 // @author       PolarSpark
 // @match        https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*
@@ -34,14 +34,14 @@
     }
 
     var POS_GROUPS = [
-        { name: "ST", positions: ["ST", "CF"] },
-        { name: "LW/RW/LM/RM", positions: ["LW", "RW", "LM", "RM"] },
-        { name: "CAM", positions: ["CAM"] },
-        { name: "CM", positions: ["CM"] },
-        { name: "CDM", positions: ["CDM"] },
-        { name: "CB", positions: ["CB"] },
-        { name: "LB/RB", positions: ["LB", "RB", "LWB", "RWB"] },
-        { name: "GK", positions: ["GK"] },
+        { name: "ST", label: "前锋", positions: ["ST", "CF"] },
+        { name: "LW/RW/LM/RM", label: "边路", positions: ["LW", "RW", "LM", "RM"] },
+        { name: "CAM", label: "前腰", positions: ["CAM"] },
+        { name: "CM", label: "中前卫", positions: ["CM"] },
+        { name: "CDM", label: "后腰", positions: ["CDM"] },
+        { name: "CB", label: "中后卫", positions: ["CB"] },
+        { name: "LB/RB", label: "边后卫", positions: ["LB", "RB", "LWB", "RWB"] },
+        { name: "GK", label: "门将", positions: ["GK"] },
     ];
 
     var RARITY_OPTIONS = [
@@ -860,17 +860,17 @@
                 var groupStr = [];
                 if (gGoldTraitIds.length > 0) groupStr.push("金" + groupGoldNames);
                 if (gSilverTraitIds.length > 0) groupStr.push("银" + groupSilverNames);
-                log(p.name + " 已有" + parts.join("、") + "，无法应用分组特技" + groupStr.join("、") + "，请手动配置", "err");
+                log(p.name + " 已有" + parts.join("、") + "，无法应用分组特技" + groupStr.join("、") + "，请手动配置", "warn");
                 return;
             }
 
             if (!goldOk) {
                 var gNames = existingGoldIds.map(function (id) { var s = slotByTraitId(id); return traitDisplayName(s ? s.slotName : ("ID:" + id), true); }).join("/");
-                log(p.name + " 已有金特技" + gNames + "，与分组金特技不兼容，已跳过金特技应用", "err");
+                log(p.name + " 已有金特技" + gNames + "，与分组金特技不兼容，已跳过金特技应用", "warn");
                 playerSilverPs[p.id] = newSilver;
             } else if (!silverOk) {
                 var sNames = existingSilverIds.map(function (id) { var s = slotByTraitId(id); return traitDisplayName(s ? s.slotName : ("ID:" + id), false); }).join("/");
-                log(p.name + " 已有银特技" + sNames + "，与分组银特技不兼容，已跳过银特技应用", "err");
+                log(p.name + " 已有银特技" + sNames + "，与分组银特技不兼容，已跳过银特技应用", "warn");
                 playerGoldPs[p.id] = newGold;
             } else {
                 playerGoldPs[p.id] = newGold;
@@ -1020,6 +1020,10 @@
         ddType = null;
         var dd = $("fc-dd");
         if (dd) dd.style.display = "none";
+        var rb = $("fc-rarity-btn");
+        if (rb) rb.classList.remove("active");
+        var allTriggers = document.querySelectorAll(".fc-dd-trigger");
+        allTriggers.forEach(function (t) { t.classList.remove("active"); });
     }
 
     function renderDropdown() {
@@ -1160,14 +1164,9 @@
     }
 
     function renderRarityFilter() {
-        var el = $("fc-batch-rarity"); if (!el) return;
-        var h = "";
-        RARITY_OPTIONS.forEach(function (r) {
-            var ck = selRarities.has(r.key);
-            h += '<label class="fc-chip' + (ck ? " on" : "") + '" data-rk="' + r.key + '">' +
-                '<span class="fc-chk">' + (ck ? "✓" : "") + '</span>' + r.label + '</label>';
-        });
-        el.innerHTML = h;
+        var btn = $("fc-rarity-btn"); if (!btn) return;
+        var count = selRarities.size;
+        btn.innerHTML = '稀有度 <span class="fc-rarity-count">(' + count + ')</span> ▼';
 
         // Update hideCompleted chip state
         var hc = $("fc-chip-hide-completed");
@@ -1175,6 +1174,57 @@
             if (hideCompleted) { hc.classList.add("on"); hc.querySelector(".fc-chk").textContent = "✓"; }
             else { hc.classList.remove("on"); hc.querySelector(".fc-chk").textContent = ""; }
         }
+    }
+
+    function openRarityDropdown() {
+        var dd = $("fc-dd"); if (!dd) return;
+        ddOpen = true;
+        ddType = "rarity";
+        var btn = $("fc-rarity-btn");
+        if (btn) btn.classList.add("active");
+
+        var h = '<div class="fc-dd-title">选择稀有度</div>';
+        RARITY_OPTIONS.forEach(function (r) {
+            var ck = selRarities.has(r.key);
+            h += '<div class="fc-dd-item' + (ck ? " on" : "") + '" data-rk="' + r.key + '">' +
+                '<span class="fc-chk">' + (ck ? "✓" : "") + '</span>' + r.label + '</div>';
+        });
+        h += '<div class="fc-dd-actions"><button class="fc-btn fc-btn-sm fc-btn-primary" id="fc-rarity-confirm">确认</button></div>';
+        dd.innerHTML = h;
+
+        // Position dropdown near the rarity button
+        var rect = btn.getBoundingClientRect();
+        dd.style.top = (rect.bottom + 4) + "px";
+        dd.style.left = Math.min(rect.left, window.innerWidth - 220) + "px";
+        dd.style.display = "block";
+
+        $("fc-rarity-confirm").addEventListener("click", function (e) {
+            e.stopPropagation();
+            closeDropdown();
+            renderRarityFilter();
+            refilterPlayers();
+        });
+    }
+
+    function handleRarityClick(rk) {
+        if (selRarities.has(rk)) selRarities.delete(rk); else selRarities.add(rk);
+        saveConfigToStorage();
+        // Re-render dropdown items in place
+        var dd = $("fc-dd");
+        if (!dd) return;
+        var items = dd.querySelectorAll(".fc-dd-item");
+        items.forEach(function (item) {
+            var rk2 = item.getAttribute("data-rk");
+            var ck = selRarities.has(rk2);
+            if (ck) { item.classList.add("on"); item.querySelector(".fc-chk").textContent = "✓"; }
+            else { item.classList.remove("on"); item.querySelector(".fc-chk").textContent = ""; }
+        });
+    }
+
+    function tabLabel(group) {
+        var label = group.label || group.name;
+        if (label.length > 5) label = label.substring(0, 4) + "…";
+        return label;
     }
 
     function renderTabs() {
@@ -1192,8 +1242,8 @@
         POS_GROUPS.forEach(function (g) {
             if (counts[g.name] === 0) return;
             var isActive = activeTab === g.name;
-            h += '<div class="fc-tab' + (isActive ? " active" : "") + '" data-tab="' + g.name + '">' +
-                g.name + ' (' + filteredCounts[g.name] + '/' + counts[g.name] + ')</div>';
+            h += '<div class="fc-tab' + (isActive ? " active" : "") + '" data-tab="' + g.name + '" title="' + (g.label || g.name) + '">' +
+                tabLabel(g) + ' (' + filteredCounts[g.name] + '/' + counts[g.name] + ')</div>';
         });
         el.innerHTML = h;
     }
@@ -1204,21 +1254,10 @@
         var gSilver = groupSilverPs[activeTab] || [];
 
         var h = "";
-        h += '<div class="fc-config-title">⚙ ' + activeTab + ' 分组特技模板</div>';
-        h += '<div class="fc-config-row">';
-        h += '<div class="fc-config-col">';
-        h += '<button class="fc-dd-trigger" data-dd="group-gold">🏅 金特技 (' + gGold.length + '/' + MAX_GOLD + ') ▼</button>';
-        h += '</div>';
-        h += '<div class="fc-config-col">';
-        h += '<button class="fc-dd-trigger" data-dd="group-silver">🥈 银特技 (' + gSilver.length + '/' + MAX_SILVER + ') ▼</button>';
-        h += '</div>';
-        h += '<div class="fc-config-col fc-config-spacer"></div>';
-        h += '<div class="fc-config-col">';
-        h += '<input id="fc-batch-search-group" placeholder="搜索球员..." style="width:120px;padding:5px 8px;border:1px solid rgba(59,130,246,0.2);border-radius:4px;background:rgba(0,0,0,0.3);color:#ddd;font-size:11px;outline:none">';
-        h += '</div>';
-        h += '<div class="fc-config-col fc-config-actions">';
+        var cfgGroup = POS_GROUPS.find(function(g) { return g.name === activeTab; });
+        var cfgLabel = cfgGroup ? (cfgGroup.label || cfgGroup.name) : activeTab;
+        h += '<div class="fc-config-title">' + cfgLabel + ' 分组特技模板</div>';
         var hasGroupTraits = gGold.length > 0 || gSilver.length > 0;
-        // Check if any player in current tab has individual configs (for reset enable)
         var hasPlayerConfigs = false;
         players.forEach(function (p) {
             if (getPosGroup(p) !== activeTab) return;
@@ -1230,23 +1269,23 @@
         var resetDisabled = (!hasPlayerConfigs && !isApplied) || running;
         var applyCls = "fc-btn fc-btn-sm " + (applyDisabled ? "fc-btn-gray" : "fc-btn-primary");
         var resetCls = "fc-btn fc-btn-sm " + (resetDisabled ? "fc-btn-gray" : "fc-btn-primary");
+
+        // ── 分组特技区域 ──
+        h += '<div class="fc-config-row">';
+        h += '<div class="fc-config-col">';
+        h += '<button class="fc-dd-trigger" data-dd="group-gold">🏅 金特技 (' + gGold.length + '/' + MAX_GOLD + ') ▼</button>';
+        h += '</div>';
+        h += '<div class="fc-config-col">';
+        h += '<button class="fc-dd-trigger" data-dd="group-silver">🥈 银特技 (' + gSilver.length + '/' + MAX_SILVER + ') ▼</button>';
+        h += '</div>';
+        h += '<div class="fc-config-col fc-config-spacer"></div>';
+        h += '<div class="fc-config-col fc-config-actions">';
         h += '<button class="' + applyCls + '" id="fc-btn-apply-group"' + (applyDisabled ? " disabled" : "") + '>应用</button>';
         h += '<button class="' + resetCls + '" id="fc-btn-clear-group"' + (resetDisabled ? " disabled" : "") + '>重置</button>';
-        // 全选 state
-        var groupPlayers = players.filter(function (p) { return getPosGroup(p) === activeTab; });
-        var eligible = groupPlayers.filter(function (p) {
-            if (getAcademyGoldCount(p) >= MAX_GOLD && getAcademySilverCount(p) >= MAX_SILVER) return false;
-            if (isCardLocked(p)) return false;
-            return true;
-        });
-        var allSelected = eligible.length > 0 && eligible.every(function (p) { return selPlayers.has(p.id); });
-        var selBtnCls = "fc-btn fc-btn-sm fc-btn-gray";
-        if (allSelected) selBtnCls += " fc-sel-all-on";
-        h += '<button class="' + selBtnCls + '" id="fc-btn-select-all">' + (allSelected ? "✓ 全选" : "☐ 全选") + ' (' + eligible.length + ')</button>';
         h += '</div>';
         h += '</div>';
 
-        // Show selected trait names below buttons
+        // 分组特技图标
         if (gGold.length > 0 || gSilver.length > 0) {
             h += '<div class="fc-config-chips">';
             gGold.forEach(function (sid) {
@@ -1267,6 +1306,22 @@
             });
             h += '</div>';
         }
+
+        // ── 球员搜索区域 ──
+        var groupPlayers = players.filter(function (p) { return getPosGroup(p) === activeTab; });
+        var eligible = groupPlayers.filter(function (p) {
+            if (getAcademyGoldCount(p) >= MAX_GOLD && getAcademySilverCount(p) >= MAX_SILVER) return false;
+            if (isCardLocked(p)) return false;
+            return true;
+        });
+        var allSelected = eligible.length > 0 && eligible.every(function (p) { return selPlayers.has(p.id); });
+        var selBtnCls = "fc-btn fc-btn-sm fc-btn-gray";
+        if (allSelected) selBtnCls += " fc-sel-all-on";
+        h += '<div class="fc-player-toolbar">';
+        h += '<input id="fc-batch-search-group" placeholder="搜索球员..." style="width:160px;padding:5px 8px;border:1px solid rgba(59,130,246,0.2);border-radius:4px;background:rgba(0,0,0,0.3);color:#ddd;font-size:11px;outline:none">';
+        h += '<div class="fc-config-spacer" style="flex:1"></div>';
+        h += '<button class="' + selBtnCls + '" id="fc-btn-select-all">' + (allSelected ? "✓ 全选" : "☐ 全选") + ' (' + eligible.length + ')</button>';
+        h += '</div>';
 
         el.innerHTML = h;
 
@@ -1661,10 +1716,8 @@
 #fc-batch-overlay{position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483646;background:rgba(0,0,0,0.85);display:none;align-items:center;justify-content:center;}\
 #fc-batch-overlay.show{display:flex;}\
 #fc-batch-panel{position:relative;width:1100px;max-width:97vw;height:720px;max-height:94vh;background:linear-gradient(180deg,#0f0f23,#1a1a2e);border-radius:12px;display:flex;flex-direction:column;font-family:Arial,sans-serif;font-size:13px;color:#e0e0e0;box-shadow:0 0 60px rgba(59,130,246,0.3),0 8px 40px rgba(0,0,0,0.6);overflow:hidden;border:1px solid rgba(59,130,246,0.25);}\
-#fc-batch-header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid rgba(59,130,246,0.15);flex-shrink:0;background:rgba(59,130,246,0.06);flex-wrap:wrap;gap:8px;}\
-#fc-batch-header h2{margin:0;font-size:14px;color:#93c5fd;white-space:nowrap;flex-shrink:0;}\
-#fc-batch-rarity{flex:1;display:flex;justify-content:center;flex-wrap:wrap;gap:3px;}\
-#fc-batch-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex-shrink:0;}\
+#fc-batch-header{display:flex;flex-direction:column;padding:8px 14px;border-bottom:1px solid rgba(59,130,246,0.15);flex-shrink:0;background:rgba(59,130,246,0.06);gap:6px;}.fc-header-row{display:flex;align-items:center;gap:8px;}.fc-header-spacer{flex:1;}#fc-batch-header h2{margin:0;font-size:14px;color:#93c5fd;white-space:nowrap;flex-shrink:0;}.fc-rarity-btn{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border:1px solid rgba(59,130,246,0.3);border-radius:5px;background:rgba(59,130,246,0.12);color:#bfdbfe;font-size:11px;cursor:pointer;user-select:none;transition:all 0.15s;}.fc-rarity-btn:hover{background:rgba(59,130,246,0.2);border-color:rgba(59,130,246,0.5);}\
+.fc-rarity-btn .fc-rarity-count{color:#f59e0b;font-weight:700;}\
 .fc-wrap{display:flex;gap:3px;flex-wrap:wrap;}\
 .fc-chip{display:inline-flex;align-items:center;gap:3px;padding:4px 8px;border-radius:4px;font-size:11px;cursor:pointer;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);user-select:none;transition:all 0.1s;}\
 .fc-chip:hover{background:rgba(59,130,246,0.15);border-color:rgba(59,130,246,0.3);}\
@@ -1672,12 +1725,10 @@
 .fc-chk{width:14px;height:14px;display:inline-flex;align-items:center;justify-content:center;border-radius:3px;border:1px solid rgba(255,255,255,0.2);font-size:9px;flex-shrink:0;}\
 .fc-chip.on .fc-chk{background:#3b82f6;border-color:#3b82f6;color:#fff;}\
 #fc-batch-body{flex:1;display:flex;overflow:hidden;}\
-#fc-batch-sidebar{width:130px;min-width:100px;display:flex;flex-direction:column;border-right:1px solid rgba(59,130,246,0.12);overflow-y:auto;background:rgba(0,0,0,0.15);}\
-.fc-tab{padding:8px 10px;font-size:11px;cursor:pointer;border-bottom:1px solid rgba(59,130,246,0.08);color:#888;transition:all 0.15s;user-select:none;text-align:center;}\
-.fc-tab:hover{background:rgba(59,130,246,0.06);color:#ccc;}\
-.fc-tab.active{background:rgba(59,130,246,0.12);color:#bfdbfe;font-weight:600;border-left:3px solid #3b82f6;}\
+#fc-batch-tabs{display:flex;align-items:center;gap:4px;padding:8px 10px;border-bottom:1px solid rgba(59,130,246,0.12);overflow-x:auto;flex-shrink:0;background:rgba(0,0,0,0.15);}#fc-batch-tabs::-webkit-scrollbar{height:3px;}#fc-batch-tabs::-webkit-scrollbar-thumb{background:rgba(59,130,246,0.2);border-radius:2px;}.fc-tab{padding:5px 10px;font-size:11px;cursor:pointer;border-radius:5px;color:#888;transition:all 0.15s;user-select:none;white-space:nowrap;flex-shrink:0;border:1px solid transparent;}.fc-tab:hover{background:rgba(59,130,246,0.06);color:#ccc;}.fc-tab.active{background:rgba(59,130,246,0.12);color:#bfdbfe;font-weight:600;border-color:rgba(59,130,246,0.3);}\
 #fc-batch-main{flex:1;display:flex;flex-direction:column;overflow:hidden;}\
 #fc-batch-group-config{padding:10px 14px;border-bottom:1px solid rgba(59,130,246,0.1);flex-shrink:0;}\
+.fc-player-toolbar{display:flex;align-items:center;gap:8px;padding:8px 0 4px;margin-top:2px;border-top:1px solid rgba(59,130,246,0.12);}\
 .fc-config-title{margin-bottom:8px;font-size:12px;color:#bfdbfe;font-weight:600;}\
 .fc-config-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}\
 .fc-config-col{flex-shrink:0;}\
@@ -1762,6 +1813,7 @@
 .fc-dd-item.locked{color:#666;cursor:not-allowed;}\
 .fc-dd-item.exclusive{color:#555;cursor:not-allowed;opacity:.55;}\
 .fc-dd-item.disabled{opacity:.35;cursor:not-allowed;pointer-events:none;}\
+.fc-dd-item.on{color:#bfdbfe;background:rgba(59,130,246,0.12);}.fc-dd-item.on .fc-chk{background:#3b82f6;border-color:#3b82f6;color:#fff;}.fc-dd-title{font-size:12px;font-weight:600;color:#bfdbfe;padding:6px 10px;border-bottom:1px solid rgba(59,130,246,0.12);}.fc-dd-actions{display:flex;justify-content:flex-end;padding:6px 10px;border-top:1px solid rgba(59,130,246,0.12);}\
 .fc-dd-chk{width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;border-radius:3px;border:1px solid rgba(255,255,255,0.15);font-size:9px;flex-shrink:0;}\
 .fc-dd-item.selected .fc-dd-chk{background:#3b82f6;border-color:#3b82f6;color:#fff;}\
 .fc-dd-item.locked .fc-dd-chk{border-color:rgba(255,255,255,0.05);}\
@@ -1774,7 +1826,7 @@
         // Floating button
         var btn = document.createElement("button"); btn.id = "fc-batch-open-btn";
         btn.innerHTML = '<span class="fc-flask-icon"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M9 3h6M11 3v7L5.5 20A1.5 1.5 0 007 22h10a1.5 1.5 0 001.5-2l-5.5-10V3h-2z" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M6.5 19l-1 2.5h13l-1-2.5" fill="rgba(255,255,255,0.35)"/><circle cx="10" cy="17" r="1.2" fill="#fff" opacity="0.5"/><circle cx="13.5" cy="15" r=".8" fill="#fff" opacity="0.35"/><circle cx="9" cy="13" r=".6" fill="#fff" opacity="0.25"/><line x1="6" y1="8" x2="18" y2="8" stroke="#fff" stroke-width="1.2" stroke-linecap="round" opacity="0.5"/></svg></span>';
-        btn.title = "金银特技批量进化 v1.11.1";
+        btn.title = "FutKit辅助工具";
         document.body.appendChild(btn);
 
         // Overlay
@@ -1783,15 +1835,18 @@
 <div id="fc-batch-panel">\
 <div id="fc-batch-loading"><div class="fc-spinner"></div><div class="fc-loading-text">数据加载中...</div></div>\
 <div id="fc-batch-header">\
-<h2>🧪 金银特技批量进化 v1.0.0</h2>\
-<div class="fc-wrap" id="fc-batch-rarity"></div>\
-<div id="fc-batch-toolbar">\
-<label class="fc-chip on" id="fc-chip-hide-completed"><span class="fc-chk">✓</span>隐藏不可进化</label>\
+<div class="fc-header-row">\
+<h2>FutKit辅助工具 v2.0.0</h2>\
+<div class="fc-header-spacer"></div>\
 <button class="fc-btn fc-btn-gray fc-btn-sm" id="fc-batch-close">✕</button>\
+</div>\
+<div class="fc-header-row">\
+<button class="fc-rarity-btn" id="fc-rarity-btn">稀有度 ▼</button>\
+<label class="fc-chip on" id="fc-chip-hide-completed"><span class="fc-chk">✓</span>隐藏不可进化</label>\
 </div></div>\
 <div id="fc-batch-body">\
-<div id="fc-batch-sidebar"><div id="fc-batch-tabs"></div></div>\
 <div id="fc-batch-main">\
+<div id="fc-batch-tabs"></div>\
 <div id="fc-batch-group-config"></div>\
 <div id="fc-batch-player-list"><div class="fc-empty">打开面板后将自动加载数据...</div></div>\
 </div></div>\
@@ -1835,8 +1890,9 @@
         document.addEventListener("click", function (e) {
             if (!ddOpen) return;
             var trigger = e.target.closest(".fc-dd-trigger");
+            var rarityBtn = e.target.closest(".fc-rarity-btn");
             var panel = e.target.closest("#fc-dd");
-            if (!trigger && !panel) closeDropdown();
+            if (!trigger && !rarityBtn && !panel) closeDropdown();
         });
 
         // ── Dropdown trigger click (global delegation) ──
@@ -1871,13 +1927,25 @@
         });
 
         // ── Event delegation within panel ──
-        delegate("fc-batch-rarity", ".fc-chip", function (el) {
-            var rk = el.getAttribute("data-rk");
-            if (selRarities.has(rk)) selRarities.delete(rk); else selRarities.add(rk);
-            saveConfigToStorage();
-            renderRarityFilter();
-            refilterPlayers();
-        });
+        var rarityBtn = $("fc-rarity-btn");
+        if (rarityBtn) {
+            rarityBtn.addEventListener("click", function (e) {
+                e.stopPropagation();
+                if (ddOpen && ddType === "rarity") { closeDropdown(); return; }
+                openRarityDropdown();
+            });
+        }
+
+        // Handle rarity dropdown item clicks
+        var ddEl = $("fc-dd");
+        if (ddEl) {
+            ddEl.addEventListener("click", function (e) {
+                var item = e.target.closest(".fc-dd-item[data-rk]");
+                if (!item) return;
+                e.stopPropagation();
+                handleRarityClick(item.getAttribute("data-rk"));
+            });
+        }
 
         delegate("fc-batch-tabs", ".fc-tab", function (el) {
             activeTab = el.getAttribute("data-tab");
@@ -1912,7 +1980,7 @@
         renderGroupConfig();
         renderSummary();
 
-        log("🧪 金银特技批量进化 v1.0.0 已就绪", "ok");
+        log("FutKit辅助工具 v2.0.0 已就绪", "ok");
 
         // 匿名统计上报
         (function () {
