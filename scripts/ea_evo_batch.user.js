@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EA FC 26 金银特技批量进化工具
 // @namespace    futkit
-// @version      1.0.2
+// @version      1.0.3
 // @description  EA FC 26 — 批量金银特技进化 (下拉多选 + 分组模板 + 个人微调)
 // @author       PolarSpark
 // @match        https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*
@@ -67,7 +67,7 @@
                 POS_CODE_MAP = {};
                 keys.forEach(function (k) { POS_CODE_MAP[pp[k]] = k; });
             }
-        } catch (e) { log("⚠ 位置映射加载失败: " + e.message, "warn"); }
+        } catch (e) { log("位置映射加载失败: " + e.message, "warn"); }
     }
 
     function posCodeToName(code) {
@@ -228,14 +228,14 @@
                         if (r.status === 401 || r.status === 404) {
                             var newSid = getUtasSid();
                             if (newSid && newSid !== sid) {
-                                log("  🔄 cat " + catId + " 令牌过期，刷新后重试...", "warn");
+                                log("  令牌过期，刷新后重试...", "warn");
                                 sid = newSid;
                                 loadPage(offset);
                                 return;
                             }
                         }
                         if (r.status !== 200) {
-                            log("  ⚠ cat " + catId + " HTTP " + r.status + ": " + (r.responseText || "").substring(0, 150), "warn");
+                            log("  加载进化数据 HTTP " + r.status + ": " + (r.responseText || "").substring(0, 150), "warn");
                             if (allSlotsData.length > 0) { resolve(allSlotsData); return; }
                             reject(new Error("category " + catId + " HTTP " + r.status));
                             return;
@@ -260,7 +260,7 @@
                             if (slots.length >= 20) { loadPage(offset + 20); }
                             else { resolve(allSlotsData); }
                         } catch (e) {
-                            log("  ⚠ cat " + catId + " parse: " + e.message + " | " + (r.responseText || "").substring(0, 100), "warn");
+                            log("  加载进化数据 parse: " + e.message + " | " + (r.responseText || "").substring(0, 100), "warn");
                             if (allSlotsData.length > 0) resolve(allSlotsData);
                             else reject(e);
                         }
@@ -274,7 +274,7 @@
     }
 
     function loadHubAndSlots() {
-        log("📡 加载进化 slot 数据...", "info");
+        log("加载进化数据...", "info");
         var sid = getUtasSid();
         return Promise.all([fetchCategorySlots(9), fetchCategorySlots(23), fetchCategorySlots(25)]).then(function (results) {
             var raw = [].concat(results[0], results[1], results[2]);
@@ -293,8 +293,8 @@
             goldSlots.sort(function (a, b) { return a.traitId - b.traitId; });
             silverSlots.sort(function (a, b) { return a.traitId - b.traitId; });
 
-            log("✅ 金特技 slot (maxValue=3): " + goldSlots.length + " 项", "ok");
-            log("✅ 银特技 slot (maxValue=8): " + silverSlots.length + " 项", "ok");
+            log("金特技加载: " + goldSlots.length + " 项", "ok");
+            log("银特技加载: " + silverSlots.length + " 项", "ok");
 
             allSlots = goldSlots.concat(silverSlots);
 
@@ -313,7 +313,7 @@
             cleanSlotIds(playerSilverPs);
 
             if (goldSlots.length === 0 && silverSlots.length === 0) {
-                log("⚠ 未找到任何特技进化 slot", "warn");
+                log("未找到任何特技进化数据", "warn");
             }
         });
     }
@@ -336,7 +336,7 @@
                         if (s.type === "players") playerCount = s.count || 0;
                     });
                     clubPlayerCount = playerCount;
-                    log("📋 俱乐部共有 " + playerCount + " 名球员 (via Club.getStats)", "info");
+                    log("俱乐部共有 " + playerCount + " 名球员", "info");
 
                     if (playerCount === 0) { resolve([]); return; }
 
@@ -356,14 +356,14 @@
                             var items = pt.response.items || pt.response.itemData || [];
                             if (items.length > 0) {
                                 allItems = items;
-                                log("✅ 全部球员加载完成: " + allItems.length + " 人 (via Club.search)", "ok");
+                                log("全部球员加载完成: " + allItems.length + " 人", "ok");
                                 if (items.length > 0) {
                                     var firstKeys = Object.keys(items[0]).sort().join(", ");
                                     var hasAA = items[0].hasOwnProperty("academyAttributes");
                                 }
                             }
                         } else {
-                            log("  ⚠ search: success=" + pt.success, "warn");
+                            log("  search: success=" + pt.success, "warn");
                         }
                         // Enrich with academyAttributes from direct API if missing
                         enrichAcademyAttributes(allItems).then(function () { resolve(allItems); });
@@ -394,7 +394,7 @@
                 headers: { "Content-Type": "application/json", "X-UT-SID": sid },
                 data: body, timeout: 30000,
                 onload: function (r) {
-                    if (r.status !== 200) { log("  ⚠ enrich API HTTP " + r.status, "warn"); resolve(); return; }
+                    if (r.status !== 200) { log("  enrich API HTTP " + r.status, "warn"); resolve(); return; }
                     try {
                         var resp = JSON.parse(r.responseText);
                         var rawItems = resp.items || resp.itemData || [];
@@ -412,12 +412,12 @@
                                 enriched++;
                             }
                         });
-                        log("✅ 已补充 " + enriched + " 名球员的 academyAttributes", "ok");
-                    } catch (e) { log("  ⚠ enrich 解析失败: " + e.message, "warn"); }
+                        log("已补充 " + enriched + " 名球员的 已进化特技", "ok");
+                    } catch (e) { log("  enrich 解析失败: " + e.message, "warn"); }
                     resolve();
                 },
-                onerror: function () { log("  ⚠ enrich API 网络错误", "warn"); resolve(); },
-                ontimeout: function () { log("  ⚠ enrich API 超时", "warn"); resolve(); }
+                onerror: function () { log("  enrich API 网络错误", "warn"); resolve(); },
+                ontimeout: function () { log("  enrich API 超时", "warn"); resolve(); }
             });
         });
     }
@@ -428,7 +428,6 @@
             RARITY_OPTIONS.forEach(function (r) { if (r.key === key) rfList.push(r.rf); });
         });
         var rfSet = new Set(rfList);
-        log("🔍 稀有度过滤: " + rfList.join(", "), "info");
 
         rfList.forEach(function (rf) {
             var cnt = 0;
@@ -436,7 +435,6 @@
         });
 
         var filtered = allItems.filter(function (it) { return rfSet.has(it.rareflag); });
-        log("🔍 过滤后合计: " + filtered.length + " 名球员 (总 " + allItems.length + ")", "info");
 
         var posCount = {};
         POS_GROUPS.forEach(function (g) { posCount[g.name] = 0; });
@@ -558,7 +556,7 @@
                 }
             }
         } catch (e) {
-            log("📋 读取页面数据失败: " + e.message, "warn");
+            log("读取页面数据失败: " + e.message, "warn");
         }
 
         // Fallback: GM cache
@@ -594,11 +592,11 @@
                             }
                         });
                         GM_setValue("fc-player-names-v2", JSON.stringify(cache));
-                    } catch (e) { log("📋 fut.to 解析失败: " + e.message, "warn"); }
+                    } catch (e) { log("fut.to 解析失败: " + e.message, "warn"); }
                     resolve();
                 },
-                onerror: function () { log("📋 fut.to 不可用", "warn"); resolve(); },
-                ontimeout: function () { log("📋 fut.to 超时", "warn"); resolve(); }
+                onerror: function () { log("fut.to 不可用", "warn"); resolve(); },
+                ontimeout: function () { log("fut.to 超时", "warn"); resolve(); }
             });
         });
     }
@@ -616,7 +614,7 @@
         if (dataLoaded) return;
         dataLoaded = true;
         showLoading();
-        log("🔄 开始加载数据...", "info");
+        log("开始加载数据...", "info");
 
         loadHubAndSlots().then(function () {
             return loadClubPlayers();
@@ -624,7 +622,7 @@
             allItemsCache = allItems;
             processFromCache(allItems);
         }).catch(function (e) {
-            log("❌ 加载失败: " + e.message, "err");
+            log("加载失败: " + e.message, "err");
             $("fc-batch-player-list").innerHTML = '<div class="fc-empty" style="color:#f87171">加载失败: ' + esc(e.message) + '<br>请检查网络后点击刷新重试</div>';
             dataLoaded = false;
             hideLoading();
@@ -726,7 +724,6 @@
             var s = slotById(t.sid);
             var sn = s ? s.slotName : "ID:" + t.sid;
             var pn = (p && p.name) ? p.name : ("#" + (p ? p.resourceId : t.pid));
-            log(pn + " ← " + sn, "info");
             renderProgress();
             try {
                 await applyEvoWithRetry(t.pid, t.sid);
@@ -739,10 +736,10 @@
             if (qi < queue.length - 1 && !stopFlag) await delay(randomInterval());
         }
         if (stopFlag) {
-            log("⏹ 已中止 (已完成 " + qi + "/" + queue.length + ")", "warn");
+            log("已中止 (已完成 " + qi + "/" + queue.length + ")", "warn");
             wasStopped = true;
         } else {
-            log("🎉 全部完成！共 " + queue.length + " 次进化", "ok");
+            log("全部完成！共 " + queue.length + " 次进化", "ok");
             queue = []; qi = 0; wasStopped = false; completedEvo = {};
         }
         running = false; stopFlag = false; updateBtns(); renderProgress();
@@ -753,7 +750,7 @@
             // Rebuild queue from current selections, skipping completed items
             buildQueue();
             if (queue.length === 0) { log("没有待执行的进化", "warn"); wasStopped = false; completedEvo = {}; updateBtns(); return; }
-            log("▶ 继续执行 " + queue.length + " 次进化 (间隔 " + (EXEC_INTERVAL / 1000) + "s)...", "info");
+            log("继续执行 " + queue.length + " 次进化 (间隔 " + (EXEC_INTERVAL / 1000) + "s)...", "info");
             qi = 0;
             wasStopped = false;
             runExec();
@@ -763,7 +760,7 @@
         buildQueue();
         if (queue.length === 0) { log("请先选择球员和特技", "warn"); return; }
         qi = 0;
-        log("▶ 开始执行 " + queue.length + " 次进化 (间隔 " + (EXEC_INTERVAL_MIN / 1000) + "-" + (EXEC_INTERVAL_MAX / 1000) + "s 随机)...", "info");
+        log("开始执行 " + queue.length + " 次进化 (间隔 " + (EXEC_INTERVAL_MIN / 1000) + "-" + (EXEC_INTERVAL_MAX / 1000) + "s 随机)...", "info");
         runExec();
     }
     function stopExec() { stopFlag = true; }
@@ -882,9 +879,9 @@
         saveConfigToStorage();
         groupApplied[activeTab] = true;
         if (skipped > 0) {
-            log("📋 已应用分组模板到 " + applied + " 名球员 (" + skipped + " 名无法应用，见红色警告)", "ok");
+            log("已应用分组模板到 " + applied + " 名球员 (" + skipped + " 名无法应用)", "ok");
         } else {
-            log("📋 已应用分组模板到 " + applied + " 名球员", "ok");
+            log("已应用分组模板到 " + applied + " 名球员", "ok");
         }
         renderPlayerList();
         renderSummary();
@@ -902,7 +899,7 @@
         });
         saveConfigToStorage();
         groupApplied[activeTab] = false;
-        log("🧹 已重置 " + cleared + " 名球员的个人特技配置 (已有进化特技不受影响)", "ok");
+        log("已重置 " + cleared + " 名球员的个人特技配置 (已有进化特技不受影响)", "ok");
         renderPlayerList();
         renderSummary();
     }
@@ -1273,12 +1270,11 @@
         // ── 分组特技区域 ──
         h += '<div class="fc-config-row">';
         h += '<div class="fc-config-col">';
-        h += '<button class="fc-dd-trigger" data-dd="group-gold">🏅 金特技 (' + gGold.length + '/' + MAX_GOLD + ') ▼</button>';
+        h += '<button class="fc-dd-trigger" data-dd="group-gold">金特技 (' + gGold.length + '/' + MAX_GOLD + ') ▼</button>';
         h += '</div>';
         h += '<div class="fc-config-col">';
-        h += '<button class="fc-dd-trigger" data-dd="group-silver">🥈 银特技 (' + gSilver.length + '/' + MAX_SILVER + ') ▼</button>';
+        h += '<button class="fc-dd-trigger" data-dd="group-silver">银特技 (' + gSilver.length + '/' + MAX_SILVER + ') ▼</button>';
         h += '</div>';
-        h += '<div class="fc-config-col fc-config-spacer"></div>';
         h += '<div class="fc-config-col fc-config-actions">';
         h += '<button class="' + applyCls + '" id="fc-btn-apply-group"' + (applyDisabled ? " disabled" : "") + '>应用</button>';
         h += '<button class="' + resetCls + '" id="fc-btn-clear-group"' + (resetDisabled ? " disabled" : "") + '>重置</button>';
@@ -1346,7 +1342,7 @@
             var allSelected = eligible.every(function (p) { return selPlayers.has(p.id); });
             if (allSelected) {
                 groupPlayers.forEach(function (p) { selPlayers.delete(p.id); });
-                log("☐ 已取消全选 " + activeTab + " 分组 (" + groupPlayers.length + " 人)", "info");
+                log("已取消全选 " + activeTab + " 分组 (" + groupPlayers.length + " 人)", "info");
             } else {
                 // Select eligible players, but only one per resourceId for unevolved cards
                 var seenRid = {};
@@ -1357,7 +1353,7 @@
                     selPlayers.add(p.id);
                 });
                 var added = eligible.filter(function (p) { return selPlayers.has(p.id); }).length;
-                log("☑ 已全选 " + activeTab + " 分组球员 (" + added + "/" + groupPlayers.length + " 人)", "info");
+                log("已全选 " + activeTab + " 分组球员 (" + added + "/" + groupPlayers.length + " 人)", "info");
             }
             saveConfigToStorage();
             renderPlayerList();
@@ -1652,7 +1648,7 @@
         a.download = "fc_evo_batch_config_" + new Date().toISOString().slice(0, 10) + ".json";
         a.click();
         URL.revokeObjectURL(a.href);
-        log("💾 配置已导出 (分组模板 + 球员配置)", "ok");
+        log("配置已导出 (分组模板 + 球员配置)", "ok");
     }
 
     function loadConfig(file) {
@@ -1672,8 +1668,8 @@
                 renderGroupConfig();
                 renderPlayerList();
                 renderSummary();
-                log("📂 配置已加载", "ok");
-            } catch (err) { log("📂 加载失败: " + err.message, "err"); }
+                log("配置已加载", "ok");
+            } catch (err) { log("配置加载失败: " + err.message, "err"); }
         };
         reader.readAsText(file);
     }
@@ -1789,11 +1785,7 @@
 #fc-batch-loading.show{display:flex;}\
 .fc-spinner{width:36px;height:36px;border:3px solid rgba(59,130,246,0.2);border-top-color:#3b82f6;border-radius:50%;animation:fc-spin 0.8s linear infinite;}\
 @keyframes fc-spin{to{transform:rotate(360deg);}}\
-@keyframes fc-shake{0%,78%,100%{transform:rotate(0deg);}81%{transform:rotate(-10deg);}84%{transform:rotate(10deg);}87%{transform:rotate(-6deg);}90%{transform:rotate(6deg);}93%{transform:rotate(-3deg);}96%{transform:rotate(3deg);}}\
 .fc-loading-text{color:#93c5fd;font-size:13px;}\
-#fc-batch-open-btn{position:fixed;bottom:20px;left:20px;z-index:2147483647;width:48px;height:48px;border-radius:50%;border:none;background:linear-gradient(135deg,#3b82f6,#06b6d4);color:#fff;cursor:pointer;box-shadow:0 4px 20px rgba(59,130,246,0.45);display:flex;align-items:center;justify-content:center;transition:transform 0.2s;}\
-#fc-batch-open-btn:hover{transform:scale(1.12);}\
-.fc-flask-icon{display:flex;align-items:center;justify-content:center;animation:fc-shake 3s ease-in-out infinite;}\
 \
 /* ── Dropdown Trigger ── */\
 .fc-dd-trigger{display:inline-flex;align-items:center;gap:4px;padding:6px 10px;border:1px solid rgba(59,130,246,0.25);border-radius:5px;background:rgba(0,0,0,0.3);color:#bfdbfe;font-size:11px;cursor:pointer;user-select:none;transition:all 0.15s;white-space:nowrap;}\
@@ -1822,12 +1814,6 @@
 .fc-dd-empty{text-align:center;color:#555;padding:16px;font-size:11px;}\
 ";
         document.head.appendChild(style);
-
-        // Floating button
-        var btn = document.createElement("button"); btn.id = "fc-batch-open-btn";
-        btn.innerHTML = '<span class="fc-flask-icon"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M9 3h6M11 3v7L5.5 20A1.5 1.5 0 007 22h10a1.5 1.5 0 001.5-2l-5.5-10V3h-2z" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M6.5 19l-1 2.5h13l-1-2.5" fill="rgba(255,255,255,0.35)"/><circle cx="10" cy="17" r="1.2" fill="#fff" opacity="0.5"/><circle cx="13.5" cy="15" r=".8" fill="#fff" opacity="0.35"/><circle cx="9" cy="13" r=".6" fill="#fff" opacity="0.25"/><line x1="6" y1="8" x2="18" y2="8" stroke="#fff" stroke-width="1.2" stroke-linecap="round" opacity="0.5"/></svg></span>';
-        btn.title = "FutKit辅助工具";
-        document.body.appendChild(btn);
 
         // Overlay
         var ov = document.createElement("div"); ov.id = "fc-batch-overlay";
@@ -1866,12 +1852,6 @@
         document.body.appendChild(dd);
 
         // ── Static bindings ──
-        btn.addEventListener("click", function () {
-            ov.classList.toggle("show");
-            if (ov.classList.contains("show") && !dataLoaded) {
-                setTimeout(doFullDataLoad, 300);
-            }
-        });
         $("fc-batch-close").addEventListener("click", function () { ov.classList.remove("show"); });
         $("fc-chip-hide-completed").addEventListener("click", function () {
             hideCompleted = !hideCompleted;
@@ -1883,7 +1863,7 @@
         $("fc-batch-btn-start").addEventListener("click", function () { running ? stopExec() : startExec(); });
         $("fc-batch-btn-copylog").addEventListener("click", function () {
             var text = logs.map(function (l) { return l.time + "  " + l.msg; }).join("\n");
-            navigator.clipboard.writeText(text).then(function () { log("📋 已复制", "ok"); });
+            navigator.clipboard.writeText(text).then(function () { log("已复制", "ok"); });
         });
 
         // ── Close dropdown on outside click ──
@@ -1990,10 +1970,69 @@
                 fetch("https://fc-stats.polarspark.workers.dev/ping", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ u: uid, v: "1.0.0", n: "evo_batch" })
+                    body: JSON.stringify({ u: uid, v: "2.0.0", n: "evo_batch" })
                 }).catch(function () {});
             } catch (e) {}
         })();
+
+        // ── 注入 Academy 页面按钮 ──
+        injectAcademyButton();
+    }
+
+    function injectAcademyButton() {
+        function tryInject() {
+            // Already injected
+            if (document.getElementById("fc-academy-btn")) return;
+
+            // Find the academy hub list container
+            var listEl = document.querySelector('[class*="ut-academy-hub-view--list"]');
+            if (!listEl) return;
+
+            // Insert position: find the bottom action area, or use listEl itself
+            // Look for a flex-center wrapper that FC Enhancer also targets
+            var insertParent = listEl.querySelector('[class*="fn:justify-end"]') || listEl.querySelector('[class*="fn:justify-center"]');
+            if (!insertParent) {
+                // Create our own wrapper at the bottom of the list
+                insertParent = document.createElement("div");
+                insertParent.className = "fn:flex fn:w-full fn:justify-end";
+                insertParent.style.cssText = "margin:12px 0;";
+                listEl.appendChild(insertParent);
+            }
+
+            // Button group container (matching FC Enhancer's structure)
+            var btnGroup = document.createElement("div");
+            btnGroup.className = "fn:flex fn:flex-col fn:items-center fn:gap-2";
+            var ourBtn = document.createElement("button");
+            ourBtn.id = "fc-academy-btn";
+            ourBtn.type = "button";
+            // Match EA button styling
+            ourBtn.className = "fn:group/button fn:inline-flex fn:shrink-0 fn:items-center fn:justify-center fn:rounded-lg fn:border fn:border-transparent fn:bg-clip-padding fn:text-sm fn:font-medium fn:whitespace-nowrap fn:transition-all fn:outline-none fn:select-none fn:h-8 fn:gap-1.5 fn:px-2.5";
+            ourBtn.style.cssText = "background:linear-gradient(135deg,#3b82f6,#06b6d4);color:#fff;cursor:pointer;";
+            ourBtn.textContent = "批量进化工具";
+            btnGroup.appendChild(ourBtn);
+            insertParent.appendChild(btnGroup);
+
+            // Click handler
+            ourBtn.addEventListener("click", function () {
+                var ov = $("fc-batch-overlay");
+                if (ov) {
+                    ov.classList.toggle("show");
+                    if (ov.classList.contains("show") && !dataLoaded) {
+                        setTimeout(doFullDataLoad, 300);
+                    }
+                }
+            });
+
+        }
+
+        // Try immediately
+        tryInject();
+
+        // Watch for DOM changes (SPA navigation)
+        var observer = new MutationObserver(function () {
+            tryInject();
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
     }
 
     setTimeout(build, 500);
