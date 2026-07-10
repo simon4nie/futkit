@@ -3,19 +3,18 @@
 // @namespace    futkit
 // @version      1.0.0
 // @description  EA FC 26 — 批量金银特技进化 (下拉多选 + 分组模板 + 个人微调)
-// @author       FC UT Desktop
+// @author       PolarSpark
 // @match        https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*
 // @match        https://www.easports.com/*/ea-sports-fc/ultimate-team/web-app/*
 // @match        https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*
 // Vercel部署
-// @downloadURL 
-// @updateURL   
+// @downloadURL  https://futkit-kohl.vercel.app/scripts/ea_evo_batch.user.js
+// @updateURL    https://futkit-kohl.vercel.app/scripts/ea_evo_batch.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
 // @connect      utas.mob.v5.prd.futc-ext.gcp.ea.com
-// @connect      api.fut.to
 // @run-at       document-end
 // ==/UserScript==
 
