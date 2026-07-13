@@ -47,6 +47,7 @@
     var RARITY_OPTIONS = [
         { key: "rf94", label: "璀璨明星", rf: 94 },
         { key: "rf98", label: "国家骄傲", rf: 98 },
+        { key: "rf103", label: "国家骄傲红色", rf: 103 },
         { key: "rf109", label: "荣耀猎手", rf: 109 },
         { key: "rf30", label: "FUT生日", rf: 30 },
     ];
@@ -83,7 +84,7 @@
     var playerGoldPs = {};     // {playerId: [slotId, ...]}
     var playerSilverPs = {};   // {playerId: [slotId, ...]}
     var activeTab = POS_GROUPS[0].name;
-    var selRarities = new Set(["rf94", "rf98", "rf109", "rf30"]);
+    var selRarities = new Set(["rf94", "rf98", "rf103", "rf109", "rf30"]);
     var hideCompleted = true;
     var running = false, wasStopped = false, stopFlag = false;
     var queue = [], qi = 0;
@@ -676,19 +677,7 @@
                 if (!validIds[parseInt(k)]) delete store[k];
             });
         });
-        selPlayers.forEach(function (pid) {
-            if (!validIds[pid]) selPlayers.delete(pid);
-        });
-        var seenRid = {};
-        var toRemove = [];
-        selPlayers.forEach(function (pid) {
-            var p = null;
-            for (var i = 0; i < players.length; i++) { if (players[i].id === pid) { p = players[i]; break; } }
-            if (!p || hasExistingEvo(p)) return;
-            if (seenRid[p.resourceId]) { toRemove.push(pid); }
-            else { seenRid[p.resourceId] = true; }
-        });
-        toRemove.forEach(function (pid) { selPlayers.delete(pid); });
+        selPlayers.clear();
         saveConfigToStorage();
         hideLoading();
     }
@@ -779,6 +768,10 @@
         } else {
             log("全部完成！共 " + queue.length + " 次进化", "ok");
             queue = []; qi = 0; wasStopped = false; completedEvo = {};
+            selPlayers.clear();
+            saveConfigToStorage();
+            renderPlayerList();
+            renderSummary();
         }
         running = false; stopFlag = false; updateBtns(); renderProgress();
     }
@@ -1229,13 +1222,17 @@
         var btn = $("fc-rarity-btn");
         if (btn) btn.classList.add("active");
 
-        var h = '<div class="fc-dd-title">选择稀有度</div>';
+        var h = '<div class="fc-dd-header-row">';
+        h += '<span class="fc-dd-title">选择稀有度</span>';
+        h += '<button class="fc-btn fc-btn-sm fc-btn-primary" id="fc-rarity-confirm">确认</button>';
+        h += '</div>';
+        h += '<div class="fc-rarity-grid">';
         RARITY_OPTIONS.forEach(function (r) {
             var ck = selRarities.has(r.key);
-            h += '<div class="fc-dd-item' + (ck ? " on" : "") + '" data-rk="' + r.key + '">' +
+            h += '<div class="fc-rarity-item' + (ck ? " on" : "") + '" data-rk="' + r.key + '">' +
                 '<span class="fc-chk">' + (ck ? "✓" : "") + '</span>' + r.label + '</div>';
         });
-        h += '<div class="fc-dd-actions"><button class="fc-btn fc-btn-sm fc-btn-primary" id="fc-rarity-confirm">确认</button></div>';
+        h += '</div>';
         dd.innerHTML = h;
 
         // Position dropdown near the rarity button
@@ -1258,7 +1255,7 @@
         // Re-render dropdown items in place
         var dd = $("fc-dd");
         if (!dd) return;
-        var items = dd.querySelectorAll(".fc-dd-item");
+        var items = dd.querySelectorAll(".fc-rarity-item");
         items.forEach(function (item) {
             var rk2 = item.getAttribute("data-rk");
             var ck = selRarities.has(rk2);
@@ -1855,7 +1852,12 @@
 .fc-dd-item.locked{color:#666;cursor:not-allowed;}\
 .fc-dd-item.exclusive{color:#555;cursor:not-allowed;opacity:.55;}\
 .fc-dd-item.disabled{opacity:.35;cursor:not-allowed;pointer-events:none;}\
-.fc-dd-item.on{color:#bfdbfe;background:rgba(59,130,246,0.12);}.fc-dd-item.on .fc-chk{background:#3b82f6;border-color:#3b82f6;color:#fff;}.fc-dd-title{font-size:12px;font-weight:600;color:#bfdbfe;padding:6px 10px;border-bottom:1px solid rgba(59,130,246,0.12);}.fc-dd-actions{display:flex;justify-content:flex-end;padding:6px 10px;border-top:1px solid rgba(59,130,246,0.12);}\
+.fc-dd-item.on{color:#bfdbfe;background:rgba(59,130,246,0.12);}.fc-dd-item.on .fc-chk{background:#3b82f6;border-color:#3b82f6;color:#fff;}.fc-dd-title{font-size:12px;font-weight:600;color:#bfdbfe;}.fc-dd-actions{display:flex;justify-content:flex-end;padding:6px 10px;border-top:1px solid rgba(59,130,246,0.12);}\
+.fc-dd-header-row{display:flex;align-items:center;justify-content:space-between;padding:6px 10px;border-bottom:1px solid rgba(59,130,246,0.12);}\
+.fc-rarity-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:2px;padding:4px;}\
+.fc-rarity-item{display:inline-flex;align-items:center;gap:4px;padding:3px 7px;font-size:11px;cursor:pointer;user-select:none;transition:background 0.1s;border-radius:3px;white-space:nowrap;}\
+.fc-rarity-item:hover{background:rgba(59,130,246,0.08);}\
+.fc-rarity-item.on{color:#bfdbfe;background:rgba(59,130,246,0.12);}.fc-rarity-item.on .fc-chk{background:#3b82f6;border-color:#3b82f6;color:#fff;}\
 .fc-dd-chk{width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;border-radius:3px;border:1px solid rgba(255,255,255,0.15);font-size:9px;flex-shrink:0;}\
 .fc-dd-item.selected .fc-dd-chk{background:#3b82f6;border-color:#3b82f6;color:#fff;}\
 .fc-dd-item.locked .fc-dd-chk{border-color:rgba(255,255,255,0.05);}\
@@ -1970,7 +1972,7 @@
         var ddEl = $("fc-dd");
         if (ddEl) {
             ddEl.addEventListener("click", function (e) {
-                var item = e.target.closest(".fc-dd-item[data-rk]");
+                var item = e.target.closest(".fc-rarity-item[data-rk]");
                 if (!item) return;
                 e.stopPropagation();
                 handleRarityClick(item.getAttribute("data-rk"));
@@ -2017,10 +2019,11 @@
             try {
                 var uid = GM_getValue("fc-evo-uid");
                 if (!uid) { uid = crypto.randomUUID(); GM_setValue("fc-evo-uid", uid); }
+                var ver = (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || "?";
                 fetch("https://fc-stats.polarspark.workers.dev/ping", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ u: uid, v: "2.0.0", n: "evo_batch" })
+                    body: JSON.stringify({ u: uid, v: ver, n: "evo_batch" })
                 }).catch(function () {});
             } catch (e) {}
         })();
