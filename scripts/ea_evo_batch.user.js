@@ -950,17 +950,11 @@
 
     function getDropdownInfo() {
         if (ddType === "group-gold") {
-            // Silver slots that share traitId with selected gold → mutual exclusion
-            var oppTraitIds = slotIdsToTraitIds(groupSilverPs[activeTab] || []);
-            var exclusive = [];
-            goldSlots.forEach(function (s) {
-                if (oppTraitIds.indexOf(s.traitId) !== -1) exclusive.push(s.id);
-            });
             return {
                 slots: goldSlots,
                 selected: groupGoldPs[activeTab] || [],
                 locked: [],
-                exclusive: exclusive,
+                exclusive: [],
                 maxSlots: MAX_GOLD,
                 label: activeTab + " 金特技",
             };
@@ -998,13 +992,8 @@
 
         var selected = isGold ? (playerGoldPs[pid] || []) : (playerSilverPs[pid] || []);
 
-        // Build locked (🔒 cannot deselect) vs exclusive (✓ mutual exclusion, cannot select):
-        // - locked: same-type existing academy traits (already on the card)
-        // - exclusive: opposite-type existing OR opposite-type planned (same playstyle used on other side)
         var lockedIds = [];
         var exclusiveIds = [];
-        var oppPlanned = isGold ? (playerSilverPs[pid] || []) : (playerGoldPs[pid] || []);
-        var oppPlannedTraitIds = slotIdsToTraitIds(oppPlanned);
         var existingGoldTraitIds = [];
         var existingSilverTraitIds = [];
         if (p.academyAttributes) {
@@ -1014,16 +1003,23 @@
             });
         }
         var sameTypeExisting = isGold ? existingGoldTraitIds : existingSilverTraitIds;
-        var oppTypeExisting = isGold ? existingSilverTraitIds : existingGoldTraitIds;
 
         slots.forEach(function (s) {
             // Same-type already evolved → locked
             if (sameTypeExisting.indexOf(s.traitId) !== -1) lockedIds.push(s.id);
-            // Opposite-type existing (mutual exclusion with evolved traits)
-            else if (oppTypeExisting.indexOf(s.traitId) !== -1) exclusiveIds.push(s.id);
-            // Opposite-type planned (mutual exclusion with new selections)
-            else if (oppPlannedTraitIds.indexOf(s.traitId) !== -1) exclusiveIds.push(s.id);
         });
+
+        // Gold: no mutual exclusion with silver. Silver: exclude opposite-type existing & planned.
+        if (!isGold) {
+            var oppPlanned = playerGoldPs[pid] || [];
+            var oppPlannedTraitIds = slotIdsToTraitIds(oppPlanned);
+            var oppTypeExisting = existingGoldTraitIds;
+            slots.forEach(function (s) {
+                if (lockedIds.indexOf(s.id) !== -1) return;
+                if (oppTypeExisting.indexOf(s.traitId) !== -1) exclusiveIds.push(s.id);
+                else if (oppPlannedTraitIds.indexOf(s.traitId) !== -1) exclusiveIds.push(s.id);
+            });
+        }
 
         var displayName = p.name || ("#" + p.resourceId);
         return {
