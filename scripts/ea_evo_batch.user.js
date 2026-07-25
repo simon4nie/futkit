@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EA FC 26 金银特技批量进化工具
 // @namespace    futkit
-// @version      1.0.3
+// @version      1.0.4
 // @description  EA FC 26 — 批量金银特技进化 (下拉多选 + 分组模板 + 个人微调)
 // @author       PolarSpark
 // @match        https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*
@@ -26,7 +26,7 @@
     var GAME = "/ut/game/fc26";
     var EXEC_INTERVAL_MIN = 2000, EXEC_INTERVAL_MAX = 6000;
     var MAX_RETRIES = 3;
-    var MAX_GOLD = 3, MAX_SILVER = 8;
+    var MAX_GOLD = 4, MAX_SILVER = 8;
 
     function randomInterval() {
         var ms = EXEC_INTERVAL_MIN + Math.random() * (EXEC_INTERVAL_MAX - EXEC_INTERVAL_MIN);
@@ -50,6 +50,7 @@
         { key: "rf103", label: "国家骄傲红色", rf: 103 },
         { key: "rf109", label: "荣耀猎手", rf: 109 },
         { key: "rf30", label: "FUT生日", rf: 30 },
+        { key: "r16", label: "FUTTIES", rf: 16},
     ];
 
     var goldSlots = [];
@@ -249,7 +250,7 @@
                                 if (s.numberOfRepetitions !== -1) return;
                                 if (s.academyTopRewards && s.academyTopRewards.length > 0) {
                                     s.academyTopRewards.forEach(function (reward) {
-                                        if (reward.maxValue !== 3 && reward.maxValue !== 8) return;
+                                        if (reward.maxValue !== 3 && reward.maxValue !== 4 && reward.maxValue !== 8) return;
                                         allSlotsData.push({
                                             id: s.id, slotName: s.slotName,
                                             traitId: reward.value, maxValue: reward.maxValue
@@ -283,7 +284,7 @@
             goldSlots = [];
             silverSlots = [];
             raw.forEach(function (s) {
-                if (s.maxValue === 3) goldSlots.push(s);
+                if (s.maxValue === 4 || s.maxValue === 3) goldSlots.push(s);
                 else if (s.maxValue === 8) silverSlots.push(s);
             });
 
