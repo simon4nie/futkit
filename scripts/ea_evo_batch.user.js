@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EA FC 26 金银特技批量进化工具
 // @namespace    futkit
-// @version      1.0.4
+// @version      1.0.5
 // @description  EA FC 26 — 批量金银特技进化 (下拉多选 + 分组模板 + 个人微调)
 // @author       PolarSpark
 // @match        https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*
@@ -18,1740 +18,2593 @@
 // @run-at       document-end
 // ==/UserScript==
 
-(function () {
-    "use strict";
-
-    // ═══════════════ CONSTANTS ═══════════════
-    var EA = "https://utas.mob.v5.prd.futc-ext.gcp.ea.com";
-    var GAME = "/ut/game/fc26";
-    var EXEC_INTERVAL_MIN = 2000, EXEC_INTERVAL_MAX = 6000;
-    var MAX_RETRIES = 3;
-    var MAX_GOLD = 4, MAX_SILVER = 8;
-
-    function randomInterval() {
-        var ms = EXEC_INTERVAL_MIN + Math.random() * (EXEC_INTERVAL_MAX - EXEC_INTERVAL_MIN);
-        return Math.round(ms * 100) / 100;
-    }
-
-    var POS_GROUPS = [
-        { name: "ST", label: "前锋", positions: ["ST", "CF"] },
-        { name: "LW/RW/LM/RM", label: "边路", positions: ["LW", "RW", "LM", "RM"] },
-        { name: "CAM", label: "前腰", positions: ["CAM"] },
-        { name: "CM", label: "中前卫", positions: ["CM"] },
-        { name: "CDM", label: "后腰", positions: ["CDM"] },
-        { name: "CB", label: "中后卫", positions: ["CB"] },
-        { name: "LB/RB", label: "边后卫", positions: ["LB", "RB", "LWB", "RWB"] },
-        { name: "GK", label: "门将", positions: ["GK"] },
-    ];
-
-    var RARITY_OPTIONS = [
-        { key: "rf94", label: "璀璨明星", rf: 94 },
-        { key: "rf98", label: "国家骄傲", rf: 98 },
-        { key: "rf103", label: "国家骄傲红色", rf: 103 },
-        { key: "rf109", label: "荣耀猎手", rf: 109 },
-        { key: "rf30", label: "FUT生日", rf: 30 },
-        { key: "r16", label: "FUTTIES", rf: 16},
-    ];
-
-    var goldSlots = [];
-    var silverSlots = [];
-    var _traitIconBase = "";
-
-    // Position code → abbreviation map (populated at init from page's PlayerPosition enum)
-    var POS_CODE_MAP = {};
-
-    function initPosCodeMap() {
-        try {
-            var uw = unsafeWindow;
-            var pp = uw.PlayerPosition;
-            if (pp) {
-                var keys = Object.keys(pp).filter(function (k) { return isNaN(parseInt(k, 10)); });
-                POS_CODE_MAP = {};
-                keys.forEach(function (k) { POS_CODE_MAP[pp[k]] = k; });
-            }
-        } catch (e) { log("位置映射加载失败: " + e.message, "warn"); }
-    }
-
-    function posCodeToName(code) {
-        return POS_CODE_MAP[code] || ("?" + code);
-    }
-
-    // ═══════════════ STATE ═══════════════
-    var players = [];
-    var selPlayers = new Set();
-    var groupGoldPs = {};      // {posGroupName: [slotId, ...]}
-    var groupSilverPs = {};    // {posGroupName: [slotId, ...]}
-    var groupApplied = {};     // {posGroupName: true} — tracks "applied but not yet reset" state
-    var playerGoldPs = {};     // {playerId: [slotId, ...]}
-    var playerSilverPs = {};   // {playerId: [slotId, ...]}
-    var activeTab = POS_GROUPS[0].name;
-    var selRarities = new Set(["rf94", "rf98", "rf103", "rf109", "rf30"]);
-    var hideCompleted = true;
-    var running = false, wasStopped = false, stopFlag = false;
-    var queue = [], qi = 0;
-    var completedEvo = {};     // "pid:sid" → true, tracks items already applied
-    var logs = [];
-    var clubPlayerCount = 0;
-    var panelOpen = false;
-    var dataLoaded = false;
-    var allItemsCache = null;
-
-    // Dropdown state
-    var ddOpen = false;
-    var ddType = null;   // 'group-gold' | 'group-silver' | 'player-{pid}-gold' | 'player-{pid}-silver'
-
-    // ═══════════════ HELPERS ═══════════════
-    function $(id) { return document.getElementById(id); }
-    function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
-    function ts() {
-        var t = new Date();
-        return t.getHours().toString().padStart(2, "0") + ":" +
-            t.getMinutes().toString().padStart(2, "0") + ":" +
-            t.getSeconds().toString().padStart(2, "0");
-    }
-    function log(msg, type) {
-        type = type || "info";
-        logs.push({ time: ts(), msg: msg, type: type });
-        if (logs.length > 200) logs.shift();
-        renderLogs();
-    }
-    function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-
-    function slotById(id) {
-        var all = goldSlots.concat(silverSlots);
-        for (var i = 0; i < all.length; i++) { if (all[i].id === id) return all[i]; }
-        return null;
-    }
-    var allSlots = goldSlots.concat(silverSlots);
-
-    // EA internal academy playstyle ID (301-336) → icon file ID (0-35)
-    function traitIconId(internalId) { return internalId - 301; }
-
-    function slotByTraitId(traitId) {
-        for (var i = 0; i < allSlots.length; i++) { if (allSlots[i].traitId === traitId) return allSlots[i]; }
-        allSlots = goldSlots.concat(silverSlots);
-        for (var j = 0; j < allSlots.length; j++) { if (allSlots[j].traitId === traitId) return allSlots[j]; }
-        return null;
-    }
-
-    function isGoldSlot(sid) {
-        for (var i = 0; i < goldSlots.length; i++) { if (goldSlots[i].id === sid) return true; }
-        return false;
-    }
-
-    // ═══════════════ PLAYER TRAIT HELPERS ═══════════════
-
-    // EA slot names already end with + for gold, so strip trailing + before re-adding
-    function traitDisplayName(slotName, isGold) {
-        var name = slotName || "?";
-        // Strip trailing + or ++ from EA slot names
-        while (name.charAt(name.length - 1) === "+") name = name.slice(0, -1);
-        return name + (isGold ? "+" : "");
-    }
-    function getAcademyGoldCount(player) {
-        if (!player.academyAttributes) return 0;
-        var count = 0;
-        player.academyAttributes.forEach(function (a) { if (a.totalBonus === 2) count++; });
-        return count;
-    }
-    function getAcademySilverCount(player) {
-        if (!player.academyAttributes) return 0;
-        var count = 0;
-        player.academyAttributes.forEach(function (a) { if (a.totalBonus === 1) count++; });
-        return count;
-    }
-    function getExistingTraitIds(player) {
-        if (!player.academyAttributes) return [];
-        return player.academyAttributes.map(function (a) { return a.id; });
-    }
-
-    function getPosGroup(player) {
-        for (var i = 0; i < POS_GROUPS.length; i++) {
-            if (POS_GROUPS[i].positions.indexOf(player.position) !== -1) return POS_GROUPS[i].name;
-        }
-        return POS_GROUPS[POS_GROUPS.length - 1].name;
-    }
-
-    function hasExistingEvo(player) {
-        return player.academyAttributes && player.academyAttributes.length > 0;
-    }
-
-    // Same-card duplicate detection (same resourceId = same base card)
-    function sameCardGroup(player) {
-        var rid = player.resourceId;
-        return players.filter(function (p) { return p.resourceId === rid; });
-    }
-
-    // Card is locked because another copy already has academy evo
-    function isCardLocked(player) {
-        if (hasExistingEvo(player)) return false;
-        var same = sameCardGroup(player);
-        return same.some(function (p) { return p.id !== player.id && hasExistingEvo(p); });
-    }
-
-    // Card is blocked because another copy is selected (and none evolved yet)
-    function isCardDupBlocked(player) {
-        if (hasExistingEvo(player)) return false;
-        if (isCardLocked(player)) return false;
-        var same = sameCardGroup(player);
-        return same.some(function (p) { return p.id !== player.id && selPlayers.has(p.id); });
-    }
-
-    function getEffectiveSlots(playerId) {
-        return {
-            gold: playerGoldPs[playerId] || [],
-            silver: playerSilverPs[playerId] || []
-        };
-    }
-
-    // ═══════════════ DATA LOADING ═══════════════
-
-    function getUtasSid() {
-        try {
-            var uw = unsafeWindow;
-            if (uw.services && uw.services.Authentication && uw.services.Authentication.utasSession) {
-                return uw.services.Authentication.utasSession.id;
-            }
-        } catch (e) {}
-        return null;
-    }
-
-    function fetchCategorySlots(catId) {
-        var sid = getUtasSid();
-        if (!sid) return Promise.reject(new Error("无法获取 UT 会话令牌，请确保已登录 EA"));
-        return new Promise(function (resolve, reject) {
-            var allSlotsData = [];
-            function loadPage(offset) {
-                var url = EA + GAME + "/academy/category/" + catId + "?offset=" + offset + "&count=20&sortOrder=asc&slotStatus=NOT_STARTED";
-                GM_xmlhttpRequest({
-                    method: "GET", url: url, timeout: 20000,
-                    headers: { "X-UT-SID": sid },
-                    onload: function (r) {
-                        if (r.status === 401 || r.status === 404) {
-                            var newSid = getUtasSid();
-                            if (newSid && newSid !== sid) {
-                                log("  令牌过期，刷新后重试...", "warn");
-                                sid = newSid;
-                                loadPage(offset);
-                                return;
-                            }
-                        }
-                        if (r.status !== 200) {
-                            log("  加载进化数据 HTTP " + r.status + ": " + (r.responseText || "").substring(0, 150), "warn");
-                            if (allSlotsData.length > 0) { resolve(allSlotsData); return; }
-                            reject(new Error("category " + catId + " HTTP " + r.status));
-                            return;
-                        }
-                        try {
-                            var resp = JSON.parse(r.responseText);
-                            var slots = resp.slots || [];
-                            var rewardCount = 0;
-                            slots.forEach(function (s) {
-                                if (s.numberOfRepetitions !== -1) return;
-                                if (s.academyTopRewards && s.academyTopRewards.length > 0) {
-                                    s.academyTopRewards.forEach(function (reward) {
-                                        if (reward.maxValue !== 3 && reward.maxValue !== 4 && reward.maxValue !== 8) return;
-                                        allSlotsData.push({
-                                            id: s.id, slotName: s.slotName,
-                                            traitId: reward.value, maxValue: reward.maxValue
-                                        });
-                                        rewardCount++;
-                                    });
-                                }
-                            });
-                            if (slots.length >= 20) { loadPage(offset + 20); }
-                            else { resolve(allSlotsData); }
-                        } catch (e) {
-                            log("  加载进化数据 parse: " + e.message + " | " + (r.responseText || "").substring(0, 100), "warn");
-                            if (allSlotsData.length > 0) resolve(allSlotsData);
-                            else reject(e);
-                        }
-                    },
-                    onerror: function () { reject(new Error("cat " + catId + " 网络错误")); },
-                    ontimeout: function () { reject(new Error("cat " + catId + " 超时")); }
-                });
-            }
-            loadPage(0);
-        });
-    }
-
-    function loadHubAndSlots() {
-        log("加载进化数据...", "info");
-        var sid = getUtasSid();
-        return Promise.all([fetchCategorySlots(9), fetchCategorySlots(23), fetchCategorySlots(25)]).then(function (results) {
-            var raw = [].concat(results[0], results[1], results[2]);
-
-            goldSlots = [];
-            silverSlots = [];
-            raw.forEach(function (s) {
-                if (s.maxValue === 4 || s.maxValue === 3) goldSlots.push(s);
-                else if (s.maxValue === 8) silverSlots.push(s);
-            });
-
-            var seenG = {}, seenS = {};
-            goldSlots = goldSlots.filter(function (s) { if (seenG[s.id]) return false; seenG[s.id] = true; return true; });
-            silverSlots = silverSlots.filter(function (s) { if (seenS[s.id]) return false; seenS[s.id] = true; return true; });
-            // Sort by traitId ascending
-            goldSlots.sort(function (a, b) { return a.traitId - b.traitId; });
-            silverSlots.sort(function (a, b) { return a.traitId - b.traitId; });
-
-            log("金特技加载: " + goldSlots.length + " 项", "ok");
-            log("银特技加载: " + silverSlots.length + " 项", "ok");
-
-            allSlots = goldSlots.concat(silverSlots);
-
-            // Validate loaded config: remove stale slot IDs that don't match current slots
-            var validSlotIds = {};
-            allSlots.forEach(function (s) { validSlotIds[s.id] = true; });
-            function cleanSlotIds(obj) {
-                if (!obj) return;
-                Object.keys(obj).forEach(function (key) {
-                    obj[key] = obj[key].filter(function (sid) { return validSlotIds[sid]; });
-                });
-            }
-            cleanSlotIds(groupGoldPs);
-            cleanSlotIds(groupSilverPs);
-            cleanSlotIds(playerGoldPs);
-            cleanSlotIds(playerSilverPs);
-
-            if (goldSlots.length === 0 && silverSlots.length === 0) {
-                log("未找到任何特技进化数据", "warn");
-            }
-        });
-    }
-
-    function loadClubPlayers() {
-        return new Promise(function (resolve, reject) {
-            try {
-                var uw = unsafeWindow;
-                var Club = uw.services && uw.services.Club;
-                var getApp = uw.getAppMain;
-                if (!Club || !getApp) { reject(new Error("页面 services 尚未就绪，请刷新后重试")); return; }
-
-                var controller = getApp().getRootViewController();
-                Club.getStats().observe(controller, function _onStats(e, t) {
-                    e.unobserve(controller);
-                    if (!t.success) { reject(new Error("getStats 失败")); return; }
-
-                    var playerCount = 0;
-                    (t.response.stats || []).forEach(function (s) {
-                        if (s.type === "players") playerCount = s.count || 0;
-                    });
-                    clubPlayerCount = playerCount;
-                    log("俱乐部共有 " + playerCount + " 名球员", "info");
-
-                    if (playerCount === 0) { resolve([]); return; }
-
-                    var allItems = [];
-                    var seenIds = {};
-                    var PAGE_SIZE = 200;
-
-                    function loadPage(offset) {
-                        var criteria = new uw.UTSearchCriteriaDTO();
-                        criteria.type = "player";
-                        criteria.sortBy = "ovr";
-                        criteria.sort = "desc";
-                        criteria.count = PAGE_SIZE;
-                        criteria.offset = offset;
-                        criteria.searchAltPositions = true;
-
-                        Club.search(criteria).observe(controller, function _onPage(p, pt) {
-                            p.unobserve(controller);
-                            if (pt.success && pt.response) {
-                                var items = pt.response.items || pt.response.itemData || [];
-                                var newCount = 0;
-                                if (items.length > 0) {
-                                    if (allItems.length === 0) {
-                                        var f = items[0];
-                                        var sd = f._staticData || {};
-                                        log("  首条: id=" + f.id + " rf=" + f.rareflag + " pos=" + f.preferredPosition + " rating=" + f.rating + " name=" + (sd.name || f.name || "?"), "info");
-                                    }
-                                    items.forEach(function (it) {
-                                        if (!seenIds[it.id]) {
-                                            seenIds[it.id] = true;
-                                            allItems.push(it);
-                                            newCount++;
-                                        }
-                                    });
-                                }
-                                log("  第" + (offset / PAGE_SIZE + 1) + "页: " + items.length + " 条, 新增 " + newCount + " (累计 " + allItems.length + "/" + playerCount + ")", "info");
-                                if (allItems.length < playerCount && offset < playerCount) {
-                                    loadPage(offset + PAGE_SIZE);
-                                } else {
-                                    log("全部球员加载完成: " + allItems.length + " 人 (去重后)", "ok");
-                                    enrichAcademyAttributes(allItems).then(function () { resolve(allItems); });
-                                }
-                            } else {
-                                log("  第" + (offset / PAGE_SIZE + 1) + "页请求失败", "warn");
-                                resolve(allItems);
-                            }
-                        });
-                    }
-
-                    loadPage(0);
-                });
-            } catch (e) {
-                reject(new Error("loadClubPlayers: " + e.message));
-            }
-        });
-    }
-
-    function enrichAcademyAttributes(allItems) {
-        var hasAA = allItems.length > 0 && allItems[0].hasOwnProperty("academyAttributes");
-        if (hasAA) return Promise.resolve();
-
-        var sid = getUtasSid();
-        if (!sid) return Promise.resolve();
-
-        return new Promise(function (resolve) {
-            var PAGE_SIZE = 200;
-            var allRawItems = [];
-
-            function fetchPage(start) {
-                var body = JSON.stringify({
-                    count: PAGE_SIZE, start: start,
-                    sortBy: "ovr", sort: "desc", type: "player",
-                    searchAltPositions: true
-                });
-                GM_xmlhttpRequest({
-                    method: "POST",
-                    url: EA + GAME + "/club",
-                    headers: { "Content-Type": "application/json", "X-UT-SID": sid },
-                    data: body, timeout: 30000,
-                    onload: function (r) {
-                        if (r.status !== 200) { log("  enrich HTTP " + r.status, "warn"); finish(); return; }
-                        try {
-                            var resp = JSON.parse(r.responseText);
-                            var items = resp.items || resp.itemData || [];
-                            allRawItems = allRawItems.concat(items);
-                            if (items.length >= PAGE_SIZE) {
-                                fetchPage(start + PAGE_SIZE);
-                            } else {
-                                finish();
-                            }
-                        } catch (e) { log("  enrich 解析失败: " + e.message, "warn"); finish(); }
-                    },
-                    onerror: function () { log("  enrich 网络错误", "warn"); finish(); },
-                    ontimeout: function () { log("  enrich 超时", "warn"); finish(); }
-                });
-            }
-
-            function finish() {
-                var aaMap = {};
-                allRawItems.forEach(function (it) {
-                    if (it.academyAttributes && it.academyAttributes.length > 0) {
-                        aaMap[it.id] = it.academyAttributes;
-                    }
-                });
-                var enriched = 0;
-                allItems.forEach(function (it) {
-                    if (aaMap[it.id]) {
-                        it.academyAttributes = aaMap[it.id];
-                        enriched++;
-                    }
-                });
-                log("已补充 " + enriched + " 名球员的 已进化特技（共扫描 " + allRawItems.length + " 人）", "ok");
-                resolve();
-            }
-
-            fetchPage(0);
-        });
-    }
-
-    function processPlayers(allItems) {
-        var rfList = [];
-        selRarities.forEach(function (key) {
-            RARITY_OPTIONS.forEach(function (r) { if (r.key === key) rfList.push(r.rf); });
-        });
-        var rfSet = new Set(rfList);
-
-        rfList.forEach(function (rf) {
-            var cnt = 0;
-            allItems.forEach(function (it) { if (it.rareflag === rf) cnt++; });
-        });
-
-        var filtered = allItems.filter(function (it) { return rfSet.has(it.rareflag); });
-
-        var posCount = {};
-        POS_GROUPS.forEach(function (g) { posCount[g.name] = 0; });
-
-        filtered.forEach(function (it) {
-            var code = it.preferredPosition;
-            var posName = (typeof code === "string") ? code : posCodeToName(code);
-            var gp = null;
-            for (var i = 0; i < POS_GROUPS.length; i++) {
-                if (POS_GROUPS[i].positions.indexOf(posName) !== -1) { gp = POS_GROUPS[i].name; break; }
-            }
-            if (gp) posCount[gp]++;
-        });
-        players = filtered.map(function (it) {
-            // Filter academyAttributes: exclude id=0 and id=1, sort gold (totalBonus=2) first
-            var rawAttrs = it.academyAttributes || [];
-            var filteredAttrs = rawAttrs.filter(function (a) { return a.id !== 0 && a.id !== 1; });
-            filteredAttrs.sort(function (a, b) { return b.totalBonus - a.totalBonus; }); // gold first
-
-            // Resolve name: try _staticData first (has name/firstName/lastName), then other fields
-            var sd = it._staticData || {};
-            var resolvedName = sd.name || sd.knownAs || it.displayName || it.name || it._name || it.commonName || "";
-            if (!resolvedName && (sd.firstName || it.firstName)) {
-                var fn = sd.firstName || it.firstName || "";
-                var ln = sd.lastName || it.lastName || "";
-                resolvedName = (ln + " " + fn).trim();
-            }
-            // Try to get guidAssetId from various sources (raw API field for EA CDN image URL)
-            var guidAssetId = it.guidAssetId || it._guidAssetId || sd.guidAssetId || null;
-            // Also check _staticData.assetId for non-zero value (service layer gives 0 for _assetId)
-            var realAssetId = it._assetId || it.assetId;
-            if ((!realAssetId || realAssetId === 0) && sd.assetId && sd.assetId !== 0) {
-                realAssetId = sd.assetId;
-            }
-
-            return {
-                id: it.id,
-                resourceId: it.definitionId || it.resourceId,
-                assetId: realAssetId,
-                guidAssetId: guidAssetId,
-                iconId: it.iconId || it.headshotId || it.headshotAssetId || null,
-                rating: it.rating || it._rating,
-                position: (typeof it.preferredPosition === "string") ? it.preferredPosition : posCodeToName(it.preferredPosition),
-                rf: it.rareflag,
-                academyAttributes: filteredAttrs,
-                name: resolvedName,
-                _staticData: it._staticData || null,
-                _metaData: it._metaData || null,
-                _raw: it
-            };
-        });
-
-        players.sort(function (a, b) { return b.rating - a.rating; });
-
-        var newActive = null;
-        POS_GROUPS.forEach(function (g) { if (!newActive && posCount[g.name] > 0) newActive = g.name; });
-        if (newActive) activeTab = newActive;
-
-        loadPlayerNames().then(function () {
-            renderAll();
-            saveConfigToStorage();
-        });
-    }
-
-    function loadPlayerNames() {
-        var needNames = players.filter(function (p) { return !p.name || p.name === ""; });
-        var needGuid = players.filter(function (p) { return !p.guidAssetId; });
-        log("解析名称头像: 缺名字 " + needNames.length + " 人, 缺头像 " + needGuid.length + " 人, 总 " + players.length + " 人", "info");
-
-        try {
-            var uw = unsafeWindow;
-            var repos = uw.repositories;
-
-            // Approach 1: repos.Item.staticData — get guidAssetId + names
-            if (repos && repos.Item && repos.Item.staticData && typeof repos.Item.staticData.get === "function") {
-                var sdRepo = repos.Item.staticData;
-                var nameCount = 0, iconCount = 0, guidCount = 0, hitCount = 0;
-                players.forEach(function (p) {
-                    try {
-                        var d = sdRepo.get(p.resourceId) || sdRepo.get(p.id);
-                        if (d) {
-                            hitCount++;
-                            var n = d.name || d.knownAs || "";
-                            if (!n && d.firstName) n = d.lastName ? (d.lastName + " " + d.firstName) : d.firstName;
-                            if (n && (!p.name || p.name === "")) { p.name = n; nameCount++; }
-                            var icon = d.iconId || d.headshotId || d.headshotAssetId || d.portraitId;
-                            if (icon && !p.iconId) { p.iconId = icon; iconCount++; }
-                            var gid = d.guidAssetId;
-                            if (gid && !p.guidAssetId) { p.guidAssetId = gid; guidCount++; }
-                        }
-                    } catch (e2) {}
-                });
-                log("  staticData: " + hitCount + " 命中, " + nameCount + " 名字, " + guidCount + " 头像", "info");
-                if (nameCount >= needNames.length && needGuid.length === 0) { log("名称头像解析完成", "ok"); return Promise.resolve(); }
-            }
-
-            // Approach 2: repositories.Item.club items — try to get names from club items
-            if (repos && repos.Item && repos.Item.club) {
-                var clubItems = repos.Item.club.items;
-                if (clubItems && typeof clubItems.values === "function") {
-                    var vals = clubItems.values();
-                    if (vals) {
-                        var arr = [];
-                        if (typeof Symbol !== "undefined" && vals[Symbol.iterator]) arr = Array.from(vals);
-                        log("  club items: " + arr.length + " 条", "info");
-                        if (arr.length > 0) {
-                            var nameMap = {};
-                            arr.forEach(function (item) {
-                                var n = item.name || item._name || item.playerName || item.commonName || "";
-                                if (!n && item.firstName) n = item.lastName ? (item.lastName + " " + item.firstName) : item.firstName;
-                                if (n) nameMap[item.id] = n;
-                            });
-                            var fromPage = 0;
-                            needNames.forEach(function (p) {
-                                if (nameMap[p.id]) { p.name = nameMap[p.id]; fromPage++; }
-                            });
-                            log("  club items 匹配名字: " + fromPage + "/" + needNames.length, "info");
-                            if (fromPage > 0) {
-                                if (fromPage >= needNames.length) { log("名称头像解析完成(club)", "ok"); return Promise.resolve(); }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (e) {
-            log("读取页面数据失败: " + e.message, "warn");
-        }
-
-        // Fallback: GM cache
-        var cache = {};
-        try { cache = JSON.parse(GM_getValue("fc-player-names-v2", "{}")); } catch (e) {}
-
-        var fromCache = 0;
-        needNames.forEach(function (p) {
-            if (cache[p.resourceId]) { p.name = cache[p.resourceId]; fromCache++; }
-        });
-        if (fromCache >= needNames.length) {
-            return Promise.resolve();
-        }
-
-        // Fallback: fut.to (may return 0 names)
-        return new Promise(function (resolve) {
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: "https://api.fut.to/26/playermeta.json",
-                timeout: 15000,
-                onload: function (r) {
-                    try {
-                        var meta = JSON.parse(r.responseText);
-                        var loaded = 0;
-                        needNames.forEach(function (p) {
-                            if (!p.name || p.name === "") {
-                                var info = meta[p.resourceId];
-                                if (info && info[2]) {
-                                    p.name = info[2];
-                                    cache[p.resourceId] = info[2];
-                                    loaded++;
-                                }
-                            }
-                        });
-                        GM_setValue("fc-player-names-v2", JSON.stringify(cache));
-                    } catch (e) { log("fut.to 解析失败: " + e.message, "warn"); }
-                    resolve();
-                },
-                onerror: function () { log("fut.to 不可用", "warn"); resolve(); },
-                ontimeout: function () { log("fut.to 超时", "warn"); resolve(); }
-            });
-        });
-    }
-
-    function showLoading() {
-        var el = $("fc-batch-loading");
-        if (el) el.classList.add("show");
-    }
-    function hideLoading() {
-        var el = $("fc-batch-loading");
-        if (el) el.classList.remove("show");
-    }
-
-    function doFullDataLoad() {
-        if (dataLoaded) return;
-        dataLoaded = true;
-        showLoading();
-        log("开始加载数据...", "info");
-
-        loadHubAndSlots().then(function () {
-            return loadClubPlayers();
-        }).then(function (allItems) {
-            allItemsCache = allItems;
-            processFromCache(allItems);
-        }).catch(function (e) {
-            log("加载失败: " + e.message, "err");
-            $("fc-batch-player-list").innerHTML = '<div class="fc-empty" style="color:#f87171">加载失败: ' + esc(e.message) + '<br>请检查网络后点击刷新重试</div>';
-            dataLoaded = false;
-            hideLoading();
-        });
-    }
-
-    function processFromCache(allItems) {
-        processPlayers(allItems);
-        var validIds = {};
-        players.forEach(function (p) { validIds[p.id] = true; });
-        [playerGoldPs, playerSilverPs].forEach(function (store) {
-            Object.keys(store).forEach(function (k) {
-                if (!validIds[parseInt(k)]) delete store[k];
-            });
-        });
-        selPlayers.clear();
-        saveConfigToStorage();
-        hideLoading();
-    }
-
-    function refilterPlayers() {
-        if (!allItemsCache) { doFullDataLoad(); return; }
-        processFromCache(allItemsCache);
-    }
-
-    // ═══════════════ EVOLUTION EXECUTION ═══════════════
-    function applyEvo(itemId, slotId) {
-        return new Promise(function (resolve, reject) {
-            var sid = getUtasSid();
-            if (!sid) { reject(new Error("无法获取 UT 会话令牌")); return; }
-            GM_xmlhttpRequest({
-                method: "POST",
-                url: EA + GAME + "/academy/slots",
-                headers: { "Content-Type": "application/json", "X-UT-SID": sid },
-                data: JSON.stringify({ currency: null, itemId: itemId, slotId: slotId }),
-                onload: function (resp) {
-                    if (resp.status >= 200 && resp.status < 300) {
-                        resolve();
-                    } else {
-                        var errText = (resp.responseText || "").substring(0, 200);
-                        reject(new Error(resp.status + ": " + errText));
-                    }
-                },
-                onerror: function () { reject(new Error("Network error")); },
-                ontimeout: function () { reject(new Error("Timeout")); },
-                timeout: 15000
-            });
-        });
-    }
-
-    async function applyEvoWithRetry(itemId, slotId) {
-        for (var attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-            try { await applyEvo(itemId, slotId); return; }
-            catch (e) {
-                if (attempt >= MAX_RETRIES) throw e;
-                log("  重试 " + attempt + "/" + MAX_RETRIES + "...", "warn");
-                await delay(1500);
-            }
-        }
-    }
-
-    // ═══════════════ EXECUTION ENGINE ═══════════════
-    function buildQueue() {
-        queue = [];
-        selPlayers.forEach(function (pid) {
-            var effective = getEffectiveSlots(pid);
-            effective.gold.forEach(function (sid) {
-                var key = pid + ":" + sid;
-                if (!completedEvo[key]) queue.push({ pid: pid, sid: sid });
-            });
-            effective.silver.forEach(function (sid) {
-                var key = pid + ":" + sid;
-                if (!completedEvo[key]) queue.push({ pid: pid, sid: sid });
-            });
-        });
-        qi = 0;
-    }
-
-    async function runExec() {
-        if (running || queue.length === 0) return;
-        running = true; wasStopped = false; stopFlag = false; updateBtns();
-        for (; qi < queue.length; qi++) {
-            if (stopFlag) break;
-            var t = queue[qi];
-            var p = null;
-            for (var i = 0; i < players.length; i++) { if (players[i].id === t.pid) { p = players[i]; break; } }
-            var s = slotById(t.sid);
-            var sn = s ? s.slotName : "ID:" + t.sid;
-            var pn = (p && p.name) ? p.name : ("#" + (p ? p.resourceId : t.pid));
-            renderProgress();
-            try {
-                await applyEvoWithRetry(t.pid, t.sid);
-                completedEvo[t.pid + ":" + t.sid] = true;
-                log(pn + " ← " + sn + " ✅", "ok");
-            } catch (ex) {
-                log(pn + " ← " + sn + " ❌ " + (ex.message || ""), "err");
-            }
-            renderProgress();
-            if (qi < queue.length - 1 && !stopFlag) await delay(randomInterval());
-        }
-        if (stopFlag) {
-            log("已中止 (已完成 " + qi + "/" + queue.length + ")", "warn");
-            wasStopped = true;
-        } else {
-            log("全部完成！共 " + queue.length + " 次进化", "ok");
-            queue = []; qi = 0; wasStopped = false; completedEvo = {};
-            selPlayers.clear();
-            saveConfigToStorage();
-            renderPlayerList();
-            renderSummary();
-        }
-        running = false; stopFlag = false; updateBtns(); renderProgress();
-    }
-
-    function startExec() {
-        if (wasStopped) {
-            // Rebuild queue from current selections, skipping completed items
-            buildQueue();
-            if (queue.length === 0) { log("没有待执行的进化", "warn"); wasStopped = false; completedEvo = {}; updateBtns(); return; }
-            log("继续执行 " + queue.length + " 次进化 (间隔 " + (EXEC_INTERVAL / 1000) + "s)...", "info");
-            qi = 0;
-            wasStopped = false;
-            runExec();
-            return;
-        }
-        completedEvo = {};
-        buildQueue();
-        if (queue.length === 0) { log("请先选择球员和特技", "warn"); return; }
-        qi = 0;
-        log("开始执行 " + queue.length + " 次进化 (间隔 " + (EXEC_INTERVAL_MIN / 1000) + "-" + (EXEC_INTERVAL_MAX / 1000) + "s 随机)...", "info");
-        runExec();
-    }
-    function stopExec() { stopFlag = true; }
-
-    function updateBtns() {
-        var sb = $("fc-batch-btn-start");
-        if (!sb) return;
-        if (running) {
-            sb.textContent = "⏹ 停止进化";
-            sb.className = "fc-btn fc-btn-red";
-        } else if (wasStopped) {
-            sb.textContent = "▶ 继续进化 (" + (queue.length - qi) + " 次)";
-            sb.className = "fc-btn fc-btn-primary";
-        } else {
-            sb.textContent = queue.length > 0 ? "▶ 执行进化 (" + queue.length + " 次)" : "▶ 执行进化";
-            sb.className = "fc-btn fc-btn-primary";
-        }
-    }
-
-    // ═══════════════ APPLY / CLEAR LOGIC ═══════════════
-    function applyGroupToPlayers() {
-        var gGold = groupGoldPs[activeTab] || [];
-        var gSilver = groupSilverPs[activeTab] || [];
-        var gGoldTraitIds = slotIdsToTraitIds(gGold);
-        var gSilverTraitIds = slotIdsToTraitIds(gSilver);
-        var applied = 0, skipped = 0;
-
-        players.forEach(function (p) {
-            if (getPosGroup(p) !== activeTab) return;
-
-            if (!hasExistingEvo(p)) {
-                playerGoldPs[p.id] = gGold.slice();
-                playerSilverPs[p.id] = gSilver.slice();
-                applied++;
-                return;
-            }
-
-            // Gather existing trait IDs by type
-            var existingGoldIds = [];
-            var existingSilverIds = [];
-            p.academyAttributes.forEach(function (a) {
-                if (a.totalBonus === 2) existingGoldIds.push(a.id);
-                else if (a.totalBonus === 1) existingSilverIds.push(a.id);
-            });
-
-            // Filter group traits: exclude traits the player already has
-            var newGold = gGold.filter(function (sid) {
-                var s = slotById(sid);
-                return s && existingGoldIds.indexOf(s.traitId) === -1;
-            });
-            var newSilver = gSilver.filter(function (sid) {
-                var s = slotById(sid);
-                return s && existingSilverIds.indexOf(s.traitId) === -1;
-            });
-            var newGoldIds = slotIdsToTraitIds(newGold);
-            var newSilverIds = slotIdsToTraitIds(newSilver);
-
-            // --- Gold: subset check + count check ---
-            var goldTotal = existingGoldIds.length + newGoldIds.length;
-            var goldSubset = existingGoldIds.every(function (id) { return gGoldTraitIds.indexOf(id) !== -1; });
-            var goldOk = gGoldTraitIds.length === 0 || (goldSubset && goldTotal <= MAX_GOLD);
-
-            // --- Silver: subset check + count check ---
-            var silverTotal = existingSilverIds.length + newSilverIds.length;
-            var silverSubset = existingSilverIds.every(function (id) { return gSilverTraitIds.indexOf(id) !== -1; });
-            var silverOk = gSilverTraitIds.length === 0 || (silverSubset && silverTotal <= MAX_SILVER);
-
-            if (!goldOk && !silverOk) {
-                skipped++;
-                var parts = [];
-                if (gGoldTraitIds.length > 0 && existingGoldIds.length > 0) {
-                    var goldNames = existingGoldIds.map(function (id) {
-                        var s = slotByTraitId(id);
-                        return traitDisplayName(s ? s.slotName : ("ID:" + id), true);
-                    }).join("/");
-                    parts.push("金特技" + goldNames);
-                }
-                if (gSilverTraitIds.length > 0 && existingSilverIds.length > 0) {
-                    var silverNames = existingSilverIds.map(function (id) {
-                        var s = slotByTraitId(id);
-                        return traitDisplayName(s ? s.slotName : ("ID:" + id), false);
-                    }).join("/");
-                    parts.push("银特技" + silverNames);
-                }
-                if (parts.length === 0) parts.push("不兼容的特技");
-                var groupGoldNames = gGoldTraitIds.map(function (id) {
-                    var s = slotByTraitId(id);
-                    return traitDisplayName(s ? s.slotName : "?", true);
-                }).join("/");
-                var groupSilverNames = gSilverTraitIds.map(function (id) {
-                    var s = slotByTraitId(id);
-                    return traitDisplayName(s ? s.slotName : "?", false);
-                }).join("/");
-                var groupStr = [];
-                if (gGoldTraitIds.length > 0) groupStr.push("金" + groupGoldNames);
-                if (gSilverTraitIds.length > 0) groupStr.push("银" + groupSilverNames);
-                log(p.name + " 已有" + parts.join("、") + "，无法应用分组特技" + groupStr.join("、") + "，请手动配置", "warn");
-                return;
-            }
-
-            if (!goldOk) {
-                var gNames = existingGoldIds.map(function (id) { var s = slotByTraitId(id); return traitDisplayName(s ? s.slotName : ("ID:" + id), true); }).join("/");
-                log(p.name + " 已有金特技" + gNames + "，与分组金特技不兼容，已跳过金特技应用", "warn");
-                playerSilverPs[p.id] = newSilver;
-            } else if (!silverOk) {
-                var sNames = existingSilverIds.map(function (id) { var s = slotByTraitId(id); return traitDisplayName(s ? s.slotName : ("ID:" + id), false); }).join("/");
-                log(p.name + " 已有银特技" + sNames + "，与分组银特技不兼容，已跳过银特技应用", "warn");
-                playerGoldPs[p.id] = newGold;
-            } else {
-                playerGoldPs[p.id] = newGold;
-                playerSilverPs[p.id] = newSilver;
-            }
-            applied++;
-        });
-
-        saveConfigToStorage();
-        groupApplied[activeTab] = true;
-        if (skipped > 0) {
-            log("已应用分组模板到 " + applied + " 名球员 (" + skipped + " 名无法应用)", "ok");
-        } else {
-            log("已应用分组模板到 " + applied + " 名球员", "ok");
-        }
-        renderPlayerList();
-        renderSummary();
-    }
-
-    function clearGroupFromPlayers() {
-        var cleared = 0;
-        players.forEach(function (p) {
-            if (getPosGroup(p) !== activeTab) return;
-            var hadAny = (playerGoldPs[p.id] && playerGoldPs[p.id].length > 0) ||
-                         (playerSilverPs[p.id] && playerSilverPs[p.id].length > 0);
-            if (hadAny) cleared++;
-            playerGoldPs[p.id] = [];
-            playerSilverPs[p.id] = [];
-        });
-        saveConfigToStorage();
-        groupApplied[activeTab] = false;
-        log("已重置 " + cleared + " 名球员的个人特技配置 (已有进化特技不受影响)", "ok");
-        renderPlayerList();
-        renderSummary();
-    }
-
-    // ═══════════════ DROPDOWN COMPONENT ═══════════════
-
-    // Convert slot IDs to trait IDs
-    function slotIdsToTraitIds(sids) {
-        var result = [];
-        sids.forEach(function (sid) {
-            var s = slotById(sid);
-            if (s) result.push(s.traitId);
-        });
-        return result;
-    }
-
-    function getDropdownInfo() {
-        if (ddType === "group-gold") {
-            return {
-                slots: goldSlots,
-                selected: groupGoldPs[activeTab] || [],
-                locked: [],
-                exclusive: [],
-                maxSlots: MAX_GOLD,
-                label: activeTab + " 金特技",
-            };
-        }
-        if (ddType === "group-silver") {
-            var oppTraitIds = slotIdsToTraitIds(groupGoldPs[activeTab] || []);
-            var exclusive = [];
-            silverSlots.forEach(function (s) {
-                if (oppTraitIds.indexOf(s.traitId) !== -1) exclusive.push(s.id);
-            });
-            return {
-                slots: silverSlots,
-                selected: groupSilverPs[activeTab] || [],
-                locked: [],
-                exclusive: exclusive,
-                maxSlots: MAX_SILVER,
-                label: activeTab + " 银特技",
-            };
-        }
-
-        // Player dropdowns: ddType = 'player-{pid}-gold' or 'player-{pid}-silver'
-        var m = ddType.match(/^player-(\d+)-(gold|silver)$/);
-        if (!m) return null;
-        var pid = parseInt(m[1]);
-        var isGold = m[2] === "gold";
-
-        var p = null;
-        for (var i = 0; i < players.length; i++) { if (players[i].id === pid) { p = players[i]; break; } }
-        if (!p) return null;
-
-        var slots = isGold ? goldSlots : silverSlots;
-        var maxSlots = isGold ? MAX_GOLD : MAX_SILVER;
-        var existingCount = isGold ? getAcademyGoldCount(p) : getAcademySilverCount(p);
-        var effectiveMax = maxSlots - existingCount;
-
-        var selected = isGold ? (playerGoldPs[pid] || []) : (playerSilverPs[pid] || []);
-
-        var lockedIds = [];
-        var exclusiveIds = [];
-        var existingGoldTraitIds = [];
-        var existingSilverTraitIds = [];
-        if (p.academyAttributes) {
-            p.academyAttributes.forEach(function (a) {
-                if (a.totalBonus === 2) existingGoldTraitIds.push(a.id);
-                else existingSilverTraitIds.push(a.id);
-            });
-        }
-        var sameTypeExisting = isGold ? existingGoldTraitIds : existingSilverTraitIds;
-
-        slots.forEach(function (s) {
-            // Same-type already evolved → locked
-            if (sameTypeExisting.indexOf(s.traitId) !== -1) lockedIds.push(s.id);
-        });
-
-        // Gold: no mutual exclusion with silver. Silver: exclude opposite-type existing & planned.
-        if (!isGold) {
-            var oppPlanned = playerGoldPs[pid] || [];
-            var oppPlannedTraitIds = slotIdsToTraitIds(oppPlanned);
-            var oppTypeExisting = existingGoldTraitIds;
-            slots.forEach(function (s) {
-                if (lockedIds.indexOf(s.id) !== -1) return;
-                if (oppTypeExisting.indexOf(s.traitId) !== -1) exclusiveIds.push(s.id);
-                else if (oppPlannedTraitIds.indexOf(s.traitId) !== -1) exclusiveIds.push(s.id);
-            });
-        }
-
-        var displayName = p.name || ("#" + p.resourceId);
-        return {
-            slots: slots,
-            selected: selected,
-            locked: lockedIds,
-            exclusive: exclusiveIds,
-            maxSlots: effectiveMax,
-            label: displayName + " " + (isGold ? "金" : "银") + "特技",
-        };
-    }
-
-    function openDropdown(type) {
-        if (ddOpen && ddType === type) { closeDropdown(); return; }
-        ddOpen = true;
-        ddType = type;
-        renderDropdown();
-    }
-
-    function closeDropdown() {
-        ddOpen = false;
-        ddType = null;
-        var dd = $("fc-dd");
-        if (dd) dd.style.display = "none";
-        var rb = $("fc-rarity-btn");
-        if (rb) rb.classList.remove("active");
-        var allTriggers = document.querySelectorAll(".fc-dd-trigger");
-        allTriggers.forEach(function (t) { t.classList.remove("active"); });
-    }
-
-    function renderDropdown() {
-        var dd = $("fc-dd");
-        if (!dd) return;
-
-        if (!ddOpen) { dd.style.display = "none"; return; }
-
-        var info = getDropdownInfo();
-        if (!info) { closeDropdown(); return; }
-
-        // Compute max slot name length for uniform item width
-        var maxLen = 0;
-        info.slots.forEach(function (s) { if (s.slotName.length > maxLen) maxLen = s.slotName.length; });
-        var itemWidth = Math.max(maxLen * 9 + 30, 80); // ~9px per char + checkbox
-
-        var h = '<div class="fc-dd-header">' + esc(info.label) +
-            ' (' + info.selected.length + '/' + info.maxSlots + ')' +
-            '<span class="fc-dd-close" id="fc-dd-close">✕</span></div>';
-        h += '<div class="fc-dd-list">';
-
-        if (info.slots.length === 0) {
-            h += '<div class="fc-dd-empty">暂无可用特技</div>';
-        } else {
-            info.slots.forEach(function (s) {
-                var isLocked = (info.locked || []).indexOf(s.id) !== -1;
-                var isExclusive = (info.exclusive || []).indexOf(s.id) !== -1;
-                var isSelected = info.selected.indexOf(s.id) !== -1;
-                var isBlocked = isLocked || isExclusive;
-                var atMax = !isSelected && !isBlocked && info.selected.length >= info.maxSlots;
-
-                var cls = "fc-dd-item";
-                if (isLocked) cls += " locked";
-                else if (isExclusive) cls += " exclusive";
-                else if (isSelected) cls += " selected";
-                else if (atMax) cls += " disabled";
-
-                h += '<div class="' + cls + '" data-sid="' + s.id + '" style="min-width:' + itemWidth + 'px">';
-                h += '<span class="fc-dd-chk">';
-                if (isLocked) h += "🔒";
-                else if (isExclusive || isSelected) h += "✓";
-                h += "</span>";
-                h += '<span class="fc-dd-name">' + esc(s.slotName) + "</span>";
-                h += "</div>";
-            });
-        }
-        h += "</div>";
-
-        dd.innerHTML = h;
-        dd.style.display = "block";
-
-        // Bind close button
-        var closeBtn = $("fc-dd-close");
-        if (closeBtn) closeBtn.addEventListener("click", function (e) { e.stopPropagation(); closeDropdown(); });
-
-        // Position near the trigger button
-        setTimeout(function () {
-            var anchor = document.querySelector('[data-dd="' + ddType + '"]');
-            if (!anchor) anchor = document.querySelector(".fc-dd-trigger.active");
-            if (anchor) {
-                var rect = anchor.getBoundingClientRect();
-                var ddH = Math.min(dd.offsetHeight, 360);
-                var spaceBelow = window.innerHeight - rect.bottom;
-                var spaceAbove = rect.top;
-                var maxH;
-                if (spaceBelow >= ddH + 8) {
-                    dd.style.top = (rect.bottom + 4) + "px";
-                    maxH = spaceBelow - 8;
-                } else if (spaceAbove >= 160) {
-                    var top = rect.top - ddH - 4;
-                    if (top < 4) top = 4;
-                    dd.style.top = top + "px";
-                    maxH = spaceAbove - 8;
-                } else {
-                    dd.style.top = Math.max(4, (window.innerHeight - ddH) / 2) + "px";
-                    maxH = window.innerHeight - 16;
-                }
-                dd.style.maxHeight = Math.min(maxH, 360) + "px";
-                dd.style.left = Math.min(Math.max(rect.left, 4), window.innerWidth - dd.offsetWidth - 4) + "px";
-            }
-        }, 10);
-    }
-
-    function handleDropdownClick(sid) {
-        var info = getDropdownInfo();
-        if (!info) return;
-
-        // Block locked (already evolved) and exclusive (mutual exclusion) items
-        if ((info.locked || []).indexOf(sid) !== -1) return;
-        if ((info.exclusive || []).indexOf(sid) !== -1) return;
-
-        var isSelected = info.selected.indexOf(sid) !== -1;
-        if (!isSelected && info.selected.length >= info.maxSlots) return;
-
-        // Determine what to update
-        if (ddType === "group-gold") {
-            if (!groupGoldPs[activeTab]) groupGoldPs[activeTab] = [];
-            if (isSelected) {
-                groupGoldPs[activeTab] = groupGoldPs[activeTab].filter(function (s) { return s !== sid; });
-            } else {
-                groupGoldPs[activeTab].push(sid);
-            }
-            groupApplied[activeTab] = false;
-            saveConfigToStorage();
-            renderDropdown();
-            renderGroupConfig();
-        } else if (ddType === "group-silver") {
-            if (!groupSilverPs[activeTab]) groupSilverPs[activeTab] = [];
-            if (isSelected) {
-                groupSilverPs[activeTab] = groupSilverPs[activeTab].filter(function (s) { return s !== sid; });
-            } else {
-                groupSilverPs[activeTab].push(sid);
-            }
-            groupApplied[activeTab] = false;
-            saveConfigToStorage();
-            renderDropdown();
-            renderGroupConfig();
-        } else {
-            // Player dropdown
-            var m = ddType.match(/^player-(\d+)-(gold|silver)$/);
-            if (!m) return;
-            var pid = parseInt(m[1]);
-            var isGold = m[2] === "gold";
-            var storage = isGold ? playerGoldPs : playerSilverPs;
-            if (!storage[pid]) storage[pid] = [];
-            if (isSelected) {
-                storage[pid] = storage[pid].filter(function (s) { return s !== sid; });
-            } else {
-                storage[pid].push(sid);
-            }
-            saveConfigToStorage();
-            // Render player list FIRST, then dropdown — so the trigger exists for positioning
-            renderPlayerList();
-            renderSummary();
-            renderGroupConfig();
-            // Restore active class on the re-created trigger
-            var newTrigger = document.querySelector('[data-dd="' + ddType + '"]');
-            if (newTrigger) newTrigger.classList.add("active");
-            renderDropdown();
-        }
-    }
-
-    // ═══════════════ RENDER ═══════════════
-    function renderAll() {
-        renderRarityFilter();
-        renderTabs();
-        renderGroupConfig();
-        renderPlayerList();
-        renderSummary();
-    }
-
-    function renderRarityFilter() {
-        var btn = $("fc-rarity-btn"); if (!btn) return;
-        var count = selRarities.size;
-        btn.innerHTML = '稀有度 <span class="fc-rarity-count">(' + count + ')</span> ▼';
-
-        // Update hideCompleted chip state
-        var hc = $("fc-chip-hide-completed");
-        if (hc) {
-            if (hideCompleted) { hc.classList.add("on"); hc.querySelector(".fc-chk").textContent = "✓"; }
-            else { hc.classList.remove("on"); hc.querySelector(".fc-chk").textContent = ""; }
-        }
-    }
-
-    function openRarityDropdown() {
-        var dd = $("fc-dd"); if (!dd) return;
-        ddOpen = true;
-        ddType = "rarity";
-        var btn = $("fc-rarity-btn");
-        if (btn) btn.classList.add("active");
-
-        var h = '<div class="fc-dd-header-row">';
-        h += '<span class="fc-dd-title">选择稀有度</span>';
-        h += '<button class="fc-btn fc-btn-sm fc-btn-primary" id="fc-rarity-confirm">确认</button>';
-        h += '</div>';
-        h += '<div class="fc-rarity-grid">';
-        RARITY_OPTIONS.forEach(function (r) {
-            var ck = selRarities.has(r.key);
-            h += '<div class="fc-rarity-item' + (ck ? " on" : "") + '" data-rk="' + r.key + '">' +
-                '<span class="fc-chk">' + (ck ? "✓" : "") + '</span>' + r.label + '</div>';
-        });
-        h += '</div>';
-        dd.innerHTML = h;
-
-        // Position dropdown near the rarity button
-        var rect = btn.getBoundingClientRect();
-        dd.style.top = (rect.bottom + 4) + "px";
-        dd.style.left = Math.min(rect.left, window.innerWidth - 220) + "px";
-        dd.style.display = "block";
-
-        $("fc-rarity-confirm").addEventListener("click", function (e) {
-            e.stopPropagation();
-            closeDropdown();
-            renderRarityFilter();
-            refilterPlayers();
-        });
-    }
-
-    function handleRarityClick(rk) {
-        if (selRarities.has(rk)) selRarities.delete(rk); else selRarities.add(rk);
-        saveConfigToStorage();
-        // Re-render dropdown items in place
-        var dd = $("fc-dd");
-        if (!dd) return;
-        var items = dd.querySelectorAll(".fc-rarity-item");
-        items.forEach(function (item) {
-            var rk2 = item.getAttribute("data-rk");
-            var ck = selRarities.has(rk2);
-            if (ck) { item.classList.add("on"); item.querySelector(".fc-chk").textContent = "✓"; }
-            else { item.classList.remove("on"); item.querySelector(".fc-chk").textContent = ""; }
-        });
-    }
-
-    function tabLabel(group) {
-        var label = group.label || group.name;
-        if (label.length > 5) label = label.substring(0, 4) + "…";
-        return label;
-    }
-
-    function renderTabs() {
-        var el = $("fc-batch-tabs"); if (!el) return;
-        var counts = {}, filteredCounts = {};
-        POS_GROUPS.forEach(function (g) { counts[g.name] = 0; filteredCounts[g.name] = 0; });
-        players.forEach(function (p) {
-            var g = getPosGroup(p);
-            counts[g]++;
-            var full = getAcademyGoldCount(p) >= MAX_GOLD && getAcademySilverCount(p) >= MAX_SILVER;
-            if (!full && !isCardLocked(p)) filteredCounts[g]++;
-        });
-
-        var h = "";
-        POS_GROUPS.forEach(function (g) {
-            if (counts[g.name] === 0) return;
-            var isActive = activeTab === g.name;
-            h += '<div class="fc-tab' + (isActive ? " active" : "") + '" data-tab="' + g.name + '" title="' + (g.label || g.name) + '">' +
-                tabLabel(g) + ' (' + filteredCounts[g.name] + '/' + counts[g.name] + ')</div>';
-        });
-        el.innerHTML = h;
-    }
-
-    function renderGroupConfig() {
-        var el = $("fc-batch-group-config"); if (!el) return;
-        var gGold = groupGoldPs[activeTab] || [];
-        var gSilver = groupSilverPs[activeTab] || [];
-
-        var h = "";
-        var cfgGroup = POS_GROUPS.find(function(g) { return g.name === activeTab; });
-        var cfgLabel = cfgGroup ? (cfgGroup.label || cfgGroup.name) : activeTab;
-        h += '<div class="fc-config-title">' + cfgLabel + ' 分组特技模板</div>';
-        var hasGroupTraits = gGold.length > 0 || gSilver.length > 0;
-        var hasPlayerConfigs = false;
-        players.forEach(function (p) {
-            if (getPosGroup(p) !== activeTab) return;
-            if ((playerGoldPs[p.id] && playerGoldPs[p.id].length > 0) ||
-                (playerSilverPs[p.id] && playerSilverPs[p.id].length > 0)) { hasPlayerConfigs = true; }
-        });
-        var isApplied = groupApplied[activeTab] || false;
-        var applyDisabled = !hasGroupTraits || isApplied || running;
-        var resetDisabled = (!hasPlayerConfigs && !isApplied) || running;
-        var applyCls = "fc-btn fc-btn-sm " + (applyDisabled ? "fc-btn-gray" : "fc-btn-primary");
-        var resetCls = "fc-btn fc-btn-sm " + (resetDisabled ? "fc-btn-gray" : "fc-btn-primary");
-
-        // ── 分组特技区域 ──
-        h += '<div class="fc-config-row">';
-        h += '<div class="fc-config-col">';
-        h += '<button class="fc-dd-trigger" data-dd="group-gold">金特技 (' + gGold.length + '/' + MAX_GOLD + ') ▼</button>';
-        h += '</div>';
-        h += '<div class="fc-config-col">';
-        h += '<button class="fc-dd-trigger" data-dd="group-silver">银特技 (' + gSilver.length + '/' + MAX_SILVER + ') ▼</button>';
-        h += '</div>';
-        h += '<div class="fc-config-col fc-config-actions">';
-        h += '<button class="' + applyCls + '" id="fc-btn-apply-group"' + (applyDisabled ? " disabled" : "") + '>应用</button>';
-        h += '<button class="' + resetCls + '" id="fc-btn-clear-group"' + (resetDisabled ? " disabled" : "") + '>重置</button>';
-        h += '</div>';
-        h += '</div>';
-
-        // 分组特技图标
-        if (gGold.length > 0 || gSilver.length > 0) {
-            h += '<div class="fc-config-chips">';
-            gGold.forEach(function (sid) {
-                var s = slotById(sid);
-                var traitId = s ? s.traitId : null;
-                if (traitId != null) {
-                    var label = s ? traitDisplayName(s.slotName, true) : ("ID:" + traitId);
-                    h += '<img class="fc-trait-icon" src="' + _traitIconBase + 'icontrait' + traitIconId(traitId) + '.png" title="' + esc(label) + '" data-fc-name="' + esc(label) + '" data-fc-gold="1" onerror="_fcTraitImgErr(this)">';
-                }
-            });
-            gSilver.forEach(function (sid) {
-                var s = slotById(sid);
-                var traitId = s ? s.traitId : null;
-                if (traitId != null) {
-                    var label = s ? traitDisplayName(s.slotName, false) : ("ID:" + traitId);
-                    h += '<img class="fc-trait-icon" src="' + _traitIconBase + 'basetrait' + traitIconId(traitId) + '.png" title="' + esc(label) + '" data-fc-name="' + esc(label) + '" data-fc-gold="0" onerror="_fcTraitImgErr(this)">';
-                }
-            });
-            h += '</div>';
-        }
-
-        // ── 球员搜索区域 ──
-        var groupPlayers = players.filter(function (p) { return getPosGroup(p) === activeTab; });
-        var eligible = groupPlayers.filter(function (p) {
-            if (getAcademyGoldCount(p) >= MAX_GOLD && getAcademySilverCount(p) >= MAX_SILVER) return false;
-            if (isCardLocked(p)) return false;
-            return true;
-        });
-        var allSelected = eligible.length > 0 && eligible.every(function (p) { return selPlayers.has(p.id); });
-        var selBtnCls = "fc-btn fc-btn-sm fc-btn-gray";
-        if (allSelected) selBtnCls += " fc-sel-all-on";
-        h += '<div class="fc-player-toolbar">';
-        h += '<input id="fc-batch-search-group" placeholder="搜索球员..." style="width:160px;padding:5px 8px;border:1px solid rgba(59,130,246,0.2);border-radius:4px;background:rgba(0,0,0,0.3);color:#ddd;font-size:11px;outline:none">';
-        h += '<div class="fc-config-spacer" style="flex:1"></div>';
-        h += '<button class="' + selBtnCls + '" id="fc-btn-select-all">' + (allSelected ? "✓ 全选" : "☐ 全选") + ' (' + eligible.length + ')</button>';
-        h += '</div>';
-
-        el.innerHTML = h;
-
-        // Bind search input
-        var searchEl = $("fc-batch-search-group");
-        if (searchEl) searchEl.addEventListener("input", renderPlayerList);
-
-        // Bind Apply/Clear/SelectAll buttons
-        var btnApply = $("fc-btn-apply-group");
-        var btnClear = $("fc-btn-clear-group");
-        var btnSelectAll = $("fc-btn-select-all");
-        if (btnApply && !applyDisabled) btnApply.addEventListener("click", function () { applyGroupToPlayers(); renderGroupConfig(); });
-        if (btnClear && !resetDisabled) btnClear.addEventListener("click", function () { clearGroupFromPlayers(); renderGroupConfig(); });
-        if (btnSelectAll) btnSelectAll.addEventListener("click", function () {
-            var groupPlayers = players.filter(function (p) { return getPosGroup(p) === activeTab; });
-            var eligible = groupPlayers.filter(function (p) {
-                if (getAcademyGoldCount(p) >= MAX_GOLD && getAcademySilverCount(p) >= MAX_SILVER) return false;
-                if (isCardLocked(p)) return false;
-                return true;
-            });
-            // Toggle: if all eligible are selected, deselect all; otherwise select all
-            var allSelected = eligible.every(function (p) { return selPlayers.has(p.id); });
-            if (allSelected) {
-                groupPlayers.forEach(function (p) { selPlayers.delete(p.id); });
-                log("已取消全选 " + activeTab + " 分组 (" + groupPlayers.length + " 人)", "info");
-            } else {
-                // Select eligible players, but only one per resourceId for unevolved cards
-                var seenRid = {};
-                eligible.forEach(function (p) {
-                    if (hasExistingEvo(p)) { selPlayers.add(p.id); return; }
-                    if (seenRid[p.resourceId]) return; // Already selected one of this card
-                    seenRid[p.resourceId] = true;
-                    selPlayers.add(p.id);
-                });
-                var added = eligible.filter(function (p) { return selPlayers.has(p.id); }).length;
-                log("已全选 " + activeTab + " 分组球员 (" + added + "/" + groupPlayers.length + " 人)", "info");
-            }
-            saveConfigToStorage();
-            renderPlayerList();
-            renderSummary();
-            renderGroupConfig();
-        });
-    }
-
-    function renderPlayerList() {
-        var el = $("fc-batch-player-list"); if (!el) return;
-        var q = ($("fc-batch-search-group") && $("fc-batch-search-group").value || "").toLowerCase();
-
-        var groupPlayers = players.filter(function (p) {
-            if (q && p.name && p.name.toLowerCase().indexOf(q) === -1) return false;
-            return getPosGroup(p) === activeTab;
-        });
-
-        if (hideCompleted) {
-            groupPlayers = groupPlayers.filter(function (p) {
-                var full = getAcademyGoldCount(p) >= MAX_GOLD && getAcademySilverCount(p) >= MAX_SILVER;
-                if (full) return false;
-                if (isCardLocked(p)) return false;
-                return true;
-            });
-        }
-
-        if (groupPlayers.length === 0) {
-            el.innerHTML = '<div class="fc-empty">该分组暂无球员</div>';
-            return;
-        }
-
-        var h = "";
-        groupPlayers.forEach(function (p, idx) {
-            var ck = selPlayers.has(p.id);
-            var pGold = playerGoldPs[p.id] || [];
-            var pSilver = playerSilverPs[p.id] || [];
-            var existingGold = getAcademyGoldCount(p);
-            var existingSilver = getAcademySilverCount(p);
-            var isCompleted = existingGold >= MAX_GOLD && existingSilver >= MAX_SILVER;
-            var locked = isCardLocked(p);
-            var dupBlocked = !locked && !isCompleted && isCardDupBlocked(p);
-            var canSelect = !isCompleted && !locked && !dupBlocked;
-
-            var displayName = p.name || ("#" + (p.resourceId || "?"));
-            var cardCls = "fc-player-card";
-            if (ck) cardCls += " selected";
-            if (isCompleted) cardCls += " completed";
-            if (locked) cardCls += " locked-card";
-            if (dupBlocked) cardCls += " dup-blocked";
-            var lockTitle = locked ? ' title="另一张同名卡已进化，不可再选"' : '';
-            var dupTitle = dupBlocked ? ' title="同名卡已选中一张，不可同时进化多张"' : '';
-            h += '<div class="' + cardCls + '" data-pid="' + p.id + '" data-cansel="' + (canSelect ? "1" : "0") + '"' + lockTitle + dupTitle + '>';
-
-            // Row 1: checkbox + EA card view slot + name + rating + position
-            h += '<div class="fc-player-main">';
-            var chkCls = "fc-chk-box";
-            if (!canSelect) chkCls += " fc-chk-disabled";
-            if (isCompleted) chkCls += " fc-chk-completed";
-            var chkText = "";
-            if (isCompleted) chkText = "✓";
-            else if (locked) chkText = "🔒";
-            else if (dupBlocked) chkText = "⊘";
-            else if (ck) chkText = "✓";
-            h += '<span class="' + chkCls + '">' + chkText + '</span>';
-
-            // Card slot for EA native card view (populated by _renderCardViews after innerHTML)
-            h += '<div class="fc-card-slot" data-pidx="' + idx + '"></div>';
-
-            h += '<span class="fc-player-name">' + esc(displayName) + '</span>';
-            h += '<span class="fc-player-rating">' + (p.rating || "?") + '</span>';
-            h += '<span class="fc-player-pos">' + (p.position || "?") + '</span>';
-            h += '</div>';
-
-            // Row 2: per-player gold + silver dropdowns
-            h += '<div class="fc-player-dd-row">';
-            h += '<button class="fc-dd-trigger fc-dd-trigger-sm" data-dd="player-' + p.id + '-gold">' +
-                '金 (' + (existingGold + pGold.length) + '/' + MAX_GOLD + ') ▼</button>';
-            h += '<button class="fc-dd-trigger fc-dd-trigger-sm" data-dd="player-' + p.id + '-silver">' +
-                '银 (' + (existingSilver + pSilver.length) + '/' + MAX_SILVER + ') ▼</button>';
-            h += '</div>';
-
-            // Row 3: trait icons — show PNG icon, fallback to Chinese name on error
-            h += '<div class="fc-player-traits">';
-            if (p.academyAttributes && p.academyAttributes.length > 0) {
-                p.academyAttributes.forEach(function (a) {
-                    if (a.id < 100) return; // Skip non-playstyle attributes (SM, WF, etc.)
-                    var isGold = a.totalBonus === 2;
-                    var s = slotByTraitId(a.id);
-                    var label = s ? traitDisplayName(s.slotName, isGold) : ("ID:" + a.id);
-                    var prefix = isGold ? "icontrait" : "basetrait";
-                    var iconId = traitIconId(a.id);
-                    h += '<img class="fc-trait-icon" src="' + _traitIconBase + prefix + iconId + '.png" title="' + esc(label) + '" data-fc-name="' + esc(label) + '" data-fc-gold="' + (isGold ? "1" : "0") + '" onerror="_fcTraitImgErr(this)">';
-                });
-            }
-            pGold.forEach(function (sid) {
-                var s = slotById(sid);
-                var traitId = s ? s.traitId : null;
-                if (traitId != null) {
-                    var label = s ? traitDisplayName(s.slotName, true) : ("ID:" + traitId);
-                    h += '<img class="fc-trait-icon planned" src="' + _traitIconBase + 'icontrait' + traitIconId(traitId) + '.png" title="' + esc(label) + '" data-fc-name="' + esc(label) + '" data-fc-gold="1" onerror="_fcTraitImgErr(this)">';
-                }
-            });
-            pSilver.forEach(function (sid) {
-                var s = slotById(sid);
-                var traitId = s ? s.traitId : null;
-                if (traitId != null) {
-                    var label = s ? s.slotName : ("ID:" + traitId);
-                    h += '<img class="fc-trait-icon planned" src="' + _traitIconBase + 'basetrait' + traitIconId(traitId) + '.png" title="' + esc(label) + '" data-fc-name="' + esc(label) + '" data-fc-gold="0" onerror="_fcTraitImgErr(this)">';
-                }
-            });
-            h += '</div></div>';
-        });
-        el.innerHTML = h;
-
-        // Render EA native card views into slots
-        _renderCardViews(el, groupPlayers);
-    }
-
-    // Render EA-native player card views using UTItemViewFactory.
-    // Uses the same lifecycle as FCEnhancer: init → renderRestrictions=true → render(item, false).
-    var _cardViewCache = {}; // playerId → view (for destroy/reuse)
-
-    function _renderCardViews(container, groupPlayers) {
-        try {
-            var uw = unsafeWindow;
-            var factory = uw.UTItemViewFactory;
-            if (!factory || typeof factory.createSmallItem !== "function") {
-                _renderCardPlaceholders(container, groupPlayers);
-                return;
-            }
-        } catch (e) {
-            _renderCardPlaceholders(container, groupPlayers);
-            return;
-        }
-
-        var rendered = 0, placeholders = 0;
-
-        for (var i = 0; i < groupPlayers.length; i++) {
-            var p = groupPlayers[i];
-            var slot = container.querySelector('.fc-card-slot[data-pidx="' + i + '"]');
-            if (!slot) continue;
-
-            // Reuse cached view if available
-            if (_cardViewCache[p.id]) {
-                var cachedView = _cardViewCache[p.id];
-                try {
-                    var cachedRoot = cachedView.getRootElement();
-                    if (cachedRoot) {
-                        slot.innerHTML = "";
-                        slot.appendChild(cachedRoot);
-                        rendered++;
-                        continue;
-                    }
-                } catch(e) {}
-                delete _cardViewCache[p.id];
-            }
-
-            // Create EA-native card view
-            try {
-                var itemData = p._raw || p;
-                var view = factory.createSmallItem(itemData);
-                if (!view) { _renderCardPlaceholder(slot, p); placeholders++; continue; }
-
-                // FCEnhancer lifecycle
-                view.init();
-                view.renderRestrictions = true;
-                view.render(itemData, false);
-
-                // Hook renderComplete to know when canvas is ready
-                var originalComplete = view.renderComplete;
-                view.renderComplete = function () {
-                    if (originalComplete) originalComplete.apply(this, arguments);
-                    // Canvas is now rendered — mark for later verification
-                    view._fcRendered = true;
-                };
-
-                // Get root element and insert into slot
-                var rootEl = view.getRootElement();
-                if (rootEl) {
-                    _cardViewCache[p.id] = view;
-                    slot.innerHTML = "";
-                    slot.appendChild(rootEl);
-                    rendered++;
-                } else {
-                    _renderCardPlaceholder(slot, p);
-                    placeholders++;
-                }
-            } catch (e) {
-                _renderCardPlaceholder(slot, p);
-                placeholders++;
-            }
-        }
-
-        if (rendered + placeholders > 0) {
-        }
-    }
-
-    // Cleanup card view cache
-    function _clearCardViewCache() {
-        Object.keys(_cardViewCache).forEach(function (k) { delete _cardViewCache[k]; });
-    }
-
-    function _renderCardPlaceholders(container, groupPlayers) {
-        var slots = container.querySelectorAll(".fc-card-slot");
-        for (var i = 0; i < slots.length; i++) {
-            var p = groupPlayers[parseInt(slots[i].dataset.pidx)];
-            if (p) _renderCardPlaceholder(slots[i], p);
-        }
-    }
-
-    function _renderCardPlaceholder(slot, p) {
-        var rc = p.rating >= 94 ? "#f59e0b" : p.rating >= 88 ? "#1d4ed8" : p.rating >= 82 ? "#22c55e" : "#888";
-        slot.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;height:100%;background:linear-gradient(135deg,' + rc + '33,' + rc + '11);border-radius:6px;border:1px solid rgba(255,255,255,0.06);">' +
-            '<span style="font-size:20px;font-weight:800;color:' + rc + '">' + (p.rating || "?") + '</span>' +
-            '<span style="font-size:8px;font-weight:600;color:' + rc + ';opacity:0.7">' + (p.position || "?") + '</span></div>';
-    }
-
-
-
-    function renderSummary() {
-        var el = $("fc-batch-summary"); if (!el) return;
-        var totalEvo = 0;
-        selPlayers.forEach(function (pid) {
-            var effective = getEffectiveSlots(pid);
-            totalEvo += effective.gold.length + effective.silver.length;
-        });
-        el.innerHTML = "已选 <strong>" + selPlayers.size + "</strong> 球员, 总计 <strong>" + totalEvo + "</strong> 次进化" +
-            (totalEvo === 0 && selPlayers.size > 0 ? ' <span style="color:#f87171">(请使用「应用到当前分组」配置球员特技)</span>' : '');
-        updateBtns();
-    }
-
-    function renderLogs() {
-        var el = $("fc-batch-logs"); if (!el) return;
-        var h = "";
-        var start = Math.max(0, logs.length - 100);
-        for (var i = start; i < logs.length; i++) {
-            var l = logs[i];
-            var cls = l.type === "ok" ? "ok" : l.type === "err" ? "err" : l.type === "warn" ? "warn" : "info";
-            h += '<div class="fc-log-' + cls + '">' + l.time + "  " + esc(l.msg) + '</div>';
-        }
-        el.innerHTML = h;
-        el.scrollTop = el.scrollHeight;
-    }
-
-    function renderProgress() {
-        var el = $("fc-batch-progress"); if (!el) return;
-        if (queue.length === 0) { el.innerHTML = ""; return; }
-        var t = queue.length, d = qi, pct = t > 0 ? Math.round(d / t * 100) : 0;
-        el.innerHTML = '<div class="fc-pbar"><div class="fc-pfill" style="width:' + pct + '%"></div></div>' +
-            '<span class="fc-ptext">' + d + '/' + t + ' (' + pct + '%)</span>';
-    }
-
-    // ═══════════════ EVENT DELEGATION ═══════════════
-    function delegate(id, selector, handler) {
-        var el = $(id); if (!el) return;
-        el.addEventListener("click", function (e) {
-            var t = e.target.closest(selector);
-            if (t && el.contains(t)) handler(t, e);
-        });
-    }
-
-    // ═══════════════ PERSISTENCE ═══════════════
-    function saveConfigToStorage() {
-        var config = {
-            groupGoldPs: groupGoldPs,
-            groupSilverPs: groupSilverPs,
-            playerGoldPs: playerGoldPs,
-            playerSilverPs: playerSilverPs,
-            selRarities: Array.from(selRarities),
-            hideCompleted: hideCompleted,
-            selPlayers: Array.from(selPlayers),
-            groupApplied: groupApplied
-        };
-        GM_setValue("fc-evo-batch-config", JSON.stringify(config));
-    }
-
-    function saveConfig() {
-        saveConfigToStorage();
-        var config = {
-            groupGoldPs: groupGoldPs,
-            groupSilverPs: groupSilverPs,
-            playerGoldPs: playerGoldPs,
-            playerSilverPs: playerSilverPs,
-            selRarities: Array.from(selRarities),
-            hideCompleted: hideCompleted,
-            selPlayers: Array.from(selPlayers),
-            timestamp: new Date().toISOString()
-        };
-        var blob = new Blob([JSON.stringify(config, null, 2)], { type: "application/json" });
-        var a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = "fc_evo_batch_config_" + new Date().toISOString().slice(0, 10) + ".json";
-        a.click();
-        URL.revokeObjectURL(a.href);
-        log("配置已导出 (分组模板 + 球员配置)", "ok");
-    }
-
-    function loadConfig(file) {
-        var reader = new FileReader();
-        reader.onload = function (e) {
-            try {
-                var c = JSON.parse(e.target.result);
-                groupGoldPs = c.groupGoldPs || {};
-                groupSilverPs = c.groupSilverPs || {};
-                playerGoldPs = c.playerGoldPs || {};
-                playerSilverPs = c.playerSilverPs || {};
-                if (c.selRarities) selRarities = new Set(c.selRarities);
-                hideCompleted = c.hasOwnProperty("hideCompleted") ? c.hideCompleted : true;
-                if (c.selPlayers) selPlayers = new Set(c.selPlayers);
-                saveConfigToStorage();
-                renderRarityFilter();
-                renderGroupConfig();
-                renderPlayerList();
-                renderSummary();
-                log("配置已加载", "ok");
-            } catch (err) { log("配置加载失败: " + err.message, "err"); }
-        };
-        reader.readAsText(file);
-    }
-
-    function loadConfigFromStorage() {
-        try {
-            var raw = GM_getValue("fc-evo-batch-config", "");
-            if (!raw) return;
-            var c = JSON.parse(raw);
-            groupGoldPs = c.groupGoldPs || {};
-            groupSilverPs = c.groupSilverPs || {};
-            playerGoldPs = c.playerGoldPs || {};
-            playerSilverPs = c.playerSilverPs || {};
-            if (c.selRarities && c.selRarities.length > 0) selRarities = new Set(c.selRarities);
-            hideCompleted = c.hasOwnProperty("hideCompleted") ? c.hideCompleted : true;
-            if (c.selPlayers && c.selPlayers.length > 0) selPlayers = new Set(c.selPlayers);
-            groupApplied = c.groupApplied || {};
-        } catch (e) {}
-    }
-
-    // ═══════════════ PANEL BUILD ═══════════════
-    function build() {
-        if (document.getElementById("fc-batch-style")) return;
-
-        initPosCodeMap();
-        loadConfigFromStorage();
-
-        _traitIconBase = "images/traits/bio/";
-
-        // Register trait icon error fallback — shows Chinese name when PNG not available
-        unsafeWindow._fcTraitImgErr = function (img) {
-            var name = img.getAttribute("data-fc-name") || "?";
-            var isGold = img.getAttribute("data-fc-gold") === "1";
-            var cls = isGold ? "fc-tag gold" : "fc-tag silver";
-            img.outerHTML = '<span class="' + cls + '" style="font-size:10px;line-height:1.4">' + name + '</span>';
-        };
-
-        var style = document.createElement("style"); style.id = "fc-batch-style";
-        style.textContent = "\
+(() => {
+	// ═══════════════ CONSTANTS ═══════════════
+	var EA = "https://utas.mob.v5.prd.futc-ext.gcp.ea.com";
+	var GAME = "/ut/game/fc26";
+	var EXEC_INTERVAL_MIN = 2000,
+		EXEC_INTERVAL_MAX = 6000;
+	var MAX_RETRIES = 3;
+	var MAX_GOLD = 5,
+		MAX_SILVER = 8;
+
+	function randomInterval() {
+		var ms =
+			EXEC_INTERVAL_MIN +
+			Math.random() * (EXEC_INTERVAL_MAX - EXEC_INTERVAL_MIN);
+		return Math.round(ms * 100) / 100;
+	}
+
+	var POS_GROUPS = [
+		{ name: "ST", label: "前锋", positions: ["ST", "CF"] },
+		{ name: "LW/RW/LM/RM", label: "边路", positions: ["LW", "RW", "LM", "RM"] },
+		{ name: "CAM", label: "前腰", positions: ["CAM"] },
+		{ name: "CM", label: "中前卫", positions: ["CM"] },
+		{ name: "CDM", label: "后腰", positions: ["CDM"] },
+		{ name: "CB", label: "中后卫", positions: ["CB"] },
+		{ name: "LB/RB", label: "边后卫", positions: ["LB", "RB", "LWB", "RWB"] },
+		{ name: "GK", label: "门将", positions: ["GK"] },
+	];
+
+	var RARITY_OPTIONS = [
+		{ key: "all", label: "全部球员", rf: null, all: true },
+		{ key: "rf94", label: "璀璨明星", rf: 94 },
+		{ key: "rf98", label: "国家骄傲", rf: 98 },
+		{ key: "rf103", label: "国家骄傲红色", rf: 103 },
+		{ key: "rf109", label: "荣耀猎手", rf: 109 },
+		{ key: "rf30", label: "FUT生日", rf: 30 },
+		{ key: "r16", label: "FUTTIES", rf: 16 },
+	];
+
+	var goldSlots = [];
+	var silverSlots = [];
+	var _traitIconBase = "";
+
+	// Position code → abbreviation map (populated at init from page's PlayerPosition enum)
+	var POS_CODE_MAP = {};
+
+	function initPosCodeMap() {
+		try {
+			var uw = unsafeWindow;
+			var pp = uw.PlayerPosition;
+			if (pp) {
+				var keys = Object.keys(pp).filter((k) => isNaN(parseInt(k, 10)));
+				POS_CODE_MAP = {};
+				keys.forEach((k) => {
+					POS_CODE_MAP[pp[k]] = k;
+				});
+			}
+		} catch (e) {
+			log("位置映射加载失败: " + e.message, "warn");
+		}
+	}
+
+	function posCodeToName(code) {
+		return POS_CODE_MAP[code] || "?" + code;
+	}
+
+	// ═══════════════ STATE ═══════════════
+	var players = [];
+	var selPlayers = new Set();
+	var groupGoldPs = {}; // {posGroupName: [slotId, ...]}
+	var groupSilverPs = {}; // {posGroupName: [slotId, ...]}
+	var groupApplied = {}; // {posGroupName: true} — tracks "applied but not yet reset" state
+	var playerGoldPs = {}; // {playerId: [slotId, ...]}
+	var playerSilverPs = {}; // {playerId: [slotId, ...]}
+	var activeTab = POS_GROUPS[0].name;
+	var selRarities = new Set(["all"]);
+	var hideCompleted = true;
+	var running = false,
+		wasStopped = false,
+		stopFlag = false;
+	var queue = [],
+		qi = 0;
+	var completedEvo = {}; // "pid:sid" → true, tracks items already applied
+	var logs = [];
+	var clubPlayerCount = 0;
+	var panelOpen = false;
+	var dataLoaded = false;
+	var allItemsCache = null;
+
+	// Dropdown state
+	var ddOpen = false;
+	var ddType = null; // 'group-gold' | 'group-silver' | 'player-{pid}-gold' | 'player-{pid}-silver'
+
+	// ═══════════════ HELPERS ═══════════════
+	function $(id) {
+		return document.getElementById(id);
+	}
+	function esc(s) {
+		return String(s)
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;");
+	}
+	function ts() {
+		var t = new Date();
+		return (
+			t.getHours().toString().padStart(2, "0") +
+			":" +
+			t.getMinutes().toString().padStart(2, "0") +
+			":" +
+			t.getSeconds().toString().padStart(2, "0")
+		);
+	}
+	function log(msg, type) {
+		type = type || "info";
+		logs.push({ time: ts(), msg: msg, type: type });
+		if (logs.length > 200) logs.shift();
+		renderLogs();
+	}
+	function delay(ms) {
+		return new Promise((r) => {
+			setTimeout(r, ms);
+		});
+	}
+
+	function slotById(id) {
+		var all = goldSlots.concat(silverSlots);
+		for (var i = 0; i < all.length; i++) {
+			if (all[i].id === id) return all[i];
+		}
+		return null;
+	}
+	var allSlots = goldSlots.concat(silverSlots);
+
+	// EA internal academy playstyle ID (301-336) → icon file ID (0-35)
+	function traitIconId(internalId) {
+		return internalId - 301;
+	}
+
+	function slotByTraitId(traitId) {
+		for (var i = 0; i < allSlots.length; i++) {
+			if (allSlots[i].traitId === traitId) return allSlots[i];
+		}
+		allSlots = goldSlots.concat(silverSlots);
+		for (var j = 0; j < allSlots.length; j++) {
+			if (allSlots[j].traitId === traitId) return allSlots[j];
+		}
+		return null;
+	}
+
+	function isGoldSlot(sid) {
+		for (var i = 0; i < goldSlots.length; i++) {
+			if (goldSlots[i].id === sid) return true;
+		}
+		return false;
+	}
+
+	// ═══════════════ PLAYER TRAIT HELPERS ═══════════════
+
+	// EA slot names already end with + for gold, so strip trailing + before re-adding
+	function traitDisplayName(slotName, isGold) {
+		var name = slotName || "?";
+		// Strip trailing + or ++ from EA slot names
+		while (name.charAt(name.length - 1) === "+") name = name.slice(0, -1);
+		return name + (isGold ? "+" : "");
+	}
+	// Read ALL gold/silver playstyles a player currently has, including native
+	// card traits and other-evolution traits — not just gold/silver academy evos.
+	// EA PS ID (0-35, per playstyle-academy mapping) → internal ID (301-336).
+	function readPlayerTraits(it) {
+		var map = {}; // internalId -> totalBonus (2=gold, 1=silver); gold wins
+		function addTrait(id, isIcon) {
+			if (id == null) return;
+			var internalId = id >= 301 ? id : id + 301;
+			if (internalId < 301 || internalId > 340) return; // skip SM/WF etc.
+			var bonus = isIcon ? 2 : 1;
+			if (bonus > (map[internalId] || 0)) map[internalId] = bonus;
+		}
+		// 1) gold/silver academy evo traits (already internal ids)
+		(it.academyAttributes || []).forEach((a) => {
+			if (a.id < 100) return; // skip non-playstyle attributes (SM, WF, etc.)
+			addTrait(a.id, a.totalBonus === 2);
+		});
+		// 2) native + other-evolution traits
+		var list = null;
+		try {
+			if (typeof it.getPlayStyles === "function")
+				list = it.getPlayStyles() || [];
+			else if (it._playStyles) list = it._playStyles;
+			else if (Array.isArray(it.traits)) list = it.traits;
+		} catch (e) {}
+		if (list) {
+			list.forEach((t) => {
+				if (!t) return;
+				var id = t.traitId != null ? t.traitId : t.id;
+				addTrait(id, !!t.isIcon);
+			});
+		}
+		// 3) basic/plus playstyle getters (UTItemEntity methods; FCX confirms)
+		try {
+			if (typeof it.getBasicPlayStyles === "function") {
+				var base = it.getBasicPlayStyles() || [];
+				base.forEach((t) => {
+					if (t) addTrait(t.traitId != null ? t.traitId : t.id, false);
+				});
+			}
+			if (typeof it.getPlusPlayStyles === "function") {
+				var plus = it.getPlusPlayStyles() || [];
+				plus.forEach((t) => {
+					if (t) addTrait(t.traitId != null ? t.traitId : t.id, true);
+				});
+			}
+		} catch (e) {}
+		// 4) other evolutions via item.academy (baseTraits silver / iconTraits gold)
+		try {
+			var acad = it.academy;
+			if (acad) {
+				(acad._baseTraits || []).forEach((id) => addTrait(id, false));
+				(acad._iconTraits || []).forEach((id) => addTrait(id, true));
+			}
+		} catch (e) {}
+		// 5) raw baseTraits/iconTraits fields (id arrays)
+		if (Array.isArray(it.baseTraits))
+			it.baseTraits.forEach((id) => addTrait(id, false));
+		if (Array.isArray(it.iconTraits))
+			it.iconTraits.forEach((id) => addTrait(id, true));
+
+		var out = Object.keys(map).map((k) => ({
+			id: parseInt(k, 10),
+			totalBonus: map[k],
+		}));
+		out.sort((a, b) => b.totalBonus - a.totalBonus); // gold first
+		return out;
+	}
+	// Trait source: allTraits (native + other evos + academy) if available,
+	// fall back to academyAttributes for legacy player objects.
+	function traitSource(player) {
+		return player.allTraits || player.academyAttributes || [];
+	}
+	function getAcademyGoldCount(player) {
+		return traitSource(player).filter((a) => a.totalBonus === 2).length;
+	}
+	function getAcademySilverCount(player) {
+		return traitSource(player).filter((a) => a.totalBonus === 1).length;
+	}
+	function getExistingTraitIds(player) {
+		return traitSource(player).map((a) => a.id);
+	}
+
+	function getPosGroup(player) {
+		for (var i = 0; i < POS_GROUPS.length; i++) {
+			if (POS_GROUPS[i].positions.indexOf(player.position) !== -1)
+				return POS_GROUPS[i].name;
+		}
+		return POS_GROUPS[POS_GROUPS.length - 1].name;
+	}
+
+	function hasExistingEvo(player) {
+		return player.academyAttributes && player.academyAttributes.length > 0;
+	}
+
+	// Same-card duplicate detection (same resourceId = same base card)
+	function sameCardGroup(player) {
+		var rid = player.resourceId;
+		return players.filter((p) => p.resourceId === rid);
+	}
+
+	// Card is locked because another copy already has academy evo
+	function isCardLocked(player) {
+		if (hasExistingEvo(player)) return false;
+		var same = sameCardGroup(player);
+		return same.some((p) => p.id !== player.id && hasExistingEvo(p));
+	}
+
+	// Card is blocked because another copy is selected (and none evolved yet)
+	function isCardDupBlocked(player) {
+		if (hasExistingEvo(player)) return false;
+		if (isCardLocked(player)) return false;
+		var same = sameCardGroup(player);
+		return same.some((p) => p.id !== player.id && selPlayers.has(p.id));
+	}
+
+	function getEffectiveSlots(playerId) {
+		return {
+			gold: playerGoldPs[playerId] || [],
+			silver: playerSilverPs[playerId] || [],
+		};
+	}
+
+	// ═══════════════ DATA LOADING ═══════════════
+
+	function getUtasSid() {
+		try {
+			var uw = unsafeWindow;
+			if (
+				uw.services &&
+				uw.services.Authentication &&
+				uw.services.Authentication.utasSession
+			) {
+				return uw.services.Authentication.utasSession.id;
+			}
+		} catch (e) {}
+		return null;
+	}
+
+	function fetchCategorySlots(catId) {
+		var sid = getUtasSid();
+		if (!sid)
+			return Promise.reject(new Error("无法获取 UT 会话令牌，请确保已登录 EA"));
+		return new Promise((resolve, reject) => {
+			var allSlotsData = [];
+			function loadPage(offset) {
+				var url =
+					EA +
+					GAME +
+					"/academy/category/" +
+					catId +
+					"?offset=" +
+					offset +
+					"&count=20&sortOrder=asc&slotStatus=NOT_STARTED";
+				GM_xmlhttpRequest({
+					method: "GET",
+					url: url,
+					timeout: 20000,
+					headers: { "X-UT-SID": sid },
+					onload: (r) => {
+						if (r.status === 401 || r.status === 404) {
+							var newSid = getUtasSid();
+							if (newSid && newSid !== sid) {
+								log("  令牌过期，刷新后重试...", "warn");
+								sid = newSid;
+								loadPage(offset);
+								return;
+							}
+						}
+						if (r.status !== 200) {
+							log(
+								"  加载进化数据 HTTP " +
+									r.status +
+									": " +
+									(r.responseText || "").substring(0, 150),
+								"warn",
+							);
+							if (allSlotsData.length > 0) {
+								resolve(allSlotsData);
+								return;
+							}
+							reject(new Error("category " + catId + " HTTP " + r.status));
+							return;
+						}
+						try {
+							var resp = JSON.parse(r.responseText);
+							var slots = resp.slots || [];
+							var rewardCount = 0;
+							slots.forEach((s) => {
+								if (s.numberOfRepetitions !== -1) return;
+								if (s.academyTopRewards && s.academyTopRewards.length > 0) {
+									s.academyTopRewards.forEach((reward) => {
+										if (
+											reward.maxValue !== 3 &&
+											reward.maxValue !== 4 &&
+											reward.maxValue !== 5 &&
+											reward.maxValue !== 8
+										)
+											return;
+										allSlotsData.push({
+											id: s.id,
+											slotName: s.slotName,
+											traitId: reward.value,
+											maxValue: reward.maxValue,
+										});
+										rewardCount++;
+									});
+								}
+							});
+							if (slots.length >= 20) {
+								loadPage(offset + 20);
+							} else {
+								resolve(allSlotsData);
+							}
+						} catch (e) {
+							log(
+								"  加载进化数据 parse: " +
+									e.message +
+									" | " +
+									(r.responseText || "").substring(0, 100),
+								"warn",
+							);
+							if (allSlotsData.length > 0) resolve(allSlotsData);
+							else reject(e);
+						}
+					},
+					onerror: () => {
+						reject(new Error("cat " + catId + " 网络错误"));
+					},
+					ontimeout: () => {
+						reject(new Error("cat " + catId + " 超时"));
+					},
+				});
+			}
+			loadPage(0);
+		});
+	}
+
+	// Discover available academy categories dynamically (hub/v2), with fallback list
+	function fetchAcademyCategories() {
+		var sid = getUtasSid();
+		if (!sid)
+			return Promise.reject(new Error("无法获取 UT 会话令牌，请确保已登录 EA"));
+		return new Promise((resolve, reject) => {
+			function tryFetch(sidNow) {
+				var url =
+					EA +
+					GAME +
+					"/academy/hub/v2?offset=0&count=100&sortOrder=asc&slotStatus=NOT_STARTED";
+				GM_xmlhttpRequest({
+					method: "GET",
+					url: url,
+					timeout: 20000,
+					headers: { "X-UT-SID": sidNow },
+					onload: (r) => {
+						if (r.status === 401 || r.status === 404) {
+							var newSid = getUtasSid();
+							if (newSid && newSid !== sidNow) {
+								tryFetch(newSid);
+								return;
+							}
+						}
+						if (r.status !== 200) {
+							reject(new Error("hub v2 HTTP " + r.status));
+							return;
+						}
+						try {
+							var resp = JSON.parse(r.responseText);
+							var cats = resp.categories || [];
+							var ids = cats.map((c) => c.id);
+							if (ids.length === 0) {
+								reject(new Error("hub v2 无分类"));
+								return;
+							}
+							resolve(ids);
+						} catch (e) {
+							reject(e);
+						}
+					},
+					onerror: () => reject(new Error("hub v2 网络错误")),
+					ontimeout: () => reject(new Error("hub v2 超时")),
+				});
+			}
+			tryFetch(sid);
+		});
+	}
+
+	function loadHubAndSlots() {
+		log("加载进化数据...", "info");
+		// 金特技=25、银特技=23、其他=9。hub/v2 动态发现可能因 slotStatus
+		// 过滤等原因漏掉部分分类，必须与默认分类合并去重，保证三者始终被拉取。
+		var DEFAULT_CATS = [9, 23, 25];
+		return fetchAcademyCategories()
+			.catch((e) => {
+				log("动态获取进化分类失败: " + e.message + "，使用默认分类", "warn");
+				return DEFAULT_CATS;
+			})
+			.then((catIds) => {
+				var merged = DEFAULT_CATS.slice();
+				catIds.forEach((cid) => {
+					if (typeof cid === "number" && merged.indexOf(cid) === -1)
+						merged.push(cid);
+				});
+				log("进化分类: [" + merged.join(", ") + "]", "info");
+				return Promise.all(merged.map((cid) => fetchCategorySlots(cid)));
+			})
+			.then((results) => {
+				var raw = [].concat.apply([], results);
+
+				goldSlots = [];
+				silverSlots = [];
+				raw.forEach((s) => {
+					if (s.maxValue === 5 || s.maxValue === 4 || s.maxValue === 3)
+						goldSlots.push(s);
+					else if (s.maxValue === 8) silverSlots.push(s);
+				});
+
+				var seenG = {},
+					seenS = {};
+				goldSlots = goldSlots.filter((s) => {
+					if (seenG[s.id]) return false;
+					seenG[s.id] = true;
+					return true;
+				});
+				silverSlots = silverSlots.filter((s) => {
+					if (seenS[s.id]) return false;
+					seenS[s.id] = true;
+					return true;
+				});
+				// Sort by traitId ascending
+				goldSlots.sort((a, b) => a.traitId - b.traitId);
+				silverSlots.sort((a, b) => a.traitId - b.traitId);
+
+				log("金特技加载: " + goldSlots.length + " 项", "ok");
+				log("银特技加载: " + silverSlots.length + " 项", "ok");
+
+				allSlots = goldSlots.concat(silverSlots);
+
+				// Validate loaded config: remove stale slot IDs that don't match current slots
+				var validSlotIds = {};
+				allSlots.forEach((s) => {
+					validSlotIds[s.id] = true;
+				});
+				function cleanSlotIds(obj) {
+					if (!obj) return;
+					Object.keys(obj).forEach((key) => {
+						obj[key] = obj[key].filter((sid) => validSlotIds[sid]);
+					});
+				}
+				cleanSlotIds(groupGoldPs);
+				cleanSlotIds(groupSilverPs);
+				cleanSlotIds(playerGoldPs);
+				cleanSlotIds(playerSilverPs);
+
+				if (goldSlots.length === 0 && silverSlots.length === 0) {
+					log("未找到任何特技进化数据", "warn");
+				}
+			});
+	}
+
+	function loadClubPlayers() {
+		return new Promise((resolve, reject) => {
+			try {
+				var uw = unsafeWindow;
+				var Club = uw.services && uw.services.Club;
+				var getApp = uw.getAppMain;
+				if (!Club || !getApp) {
+					reject(new Error("页面 services 尚未就绪，请刷新后重试"));
+					return;
+				}
+
+				var controller = getApp().getRootViewController();
+				Club.getStats().observe(controller, function _onStats(e, t) {
+					e.unobserve(controller);
+					if (!t.success) {
+						reject(new Error("getStats 失败"));
+						return;
+					}
+
+					var playerCount = 0;
+					(t.response.stats || []).forEach((s) => {
+						if (s.type === "players") playerCount = s.count || 0;
+					});
+					clubPlayerCount = playerCount;
+					log("俱乐部共有 " + playerCount + " 名球员", "info");
+
+					if (playerCount === 0) {
+						resolve([]);
+						return;
+					}
+
+					var allItems = [];
+					var seenIds = {};
+					var PAGE_SIZE = 200;
+
+					function loadPage(offset) {
+						var criteria = new uw.UTSearchCriteriaDTO();
+						criteria.type = "player";
+						criteria.sortBy = "ovr";
+						criteria.sort = "desc";
+						criteria.count = PAGE_SIZE;
+						criteria.offset = offset;
+						criteria.searchAltPositions = true;
+
+						Club.search(criteria).observe(controller, function _onPage(p, pt) {
+							p.unobserve(controller);
+							if (pt.success && pt.response) {
+								var items = pt.response.items || pt.response.itemData || [];
+								var newCount = 0;
+								if (items.length > 0) {
+									if (allItems.length === 0) {
+										var f = items[0];
+										var sd = f._staticData || {};
+										log(
+											"  首条: id=" +
+												f.id +
+												" rf=" +
+												f.rareflag +
+												" pos=" +
+												f.preferredPosition +
+												" rating=" +
+												f.rating +
+												" name=" +
+												(sd.name || f.name || "?"),
+											"info",
+										);
+									}
+									items.forEach((it) => {
+										if (!seenIds[it.id]) {
+											seenIds[it.id] = true;
+											allItems.push(it);
+											newCount++;
+										}
+									});
+								}
+								log(
+									"  第" +
+										(offset / PAGE_SIZE + 1) +
+										"页: " +
+										items.length +
+										" 条, 新增 " +
+										newCount +
+										" (累计 " +
+										allItems.length +
+										"/" +
+										playerCount +
+										")",
+									"info",
+								);
+								if (allItems.length < playerCount && offset < playerCount) {
+									loadPage(offset + PAGE_SIZE);
+								} else {
+									log(
+										"全部球员加载完成: " + allItems.length + " 人 (去重后)",
+										"ok",
+									);
+									enrichAcademyAttributes(allItems).then(() => {
+										resolve(allItems);
+									});
+								}
+							} else {
+								log("  第" + (offset / PAGE_SIZE + 1) + "页请求失败", "warn");
+								resolve(allItems);
+							}
+						});
+					}
+
+					loadPage(0);
+				});
+			} catch (e) {
+				reject(new Error("loadClubPlayers: " + e.message));
+			}
+		});
+	}
+
+	function enrichAcademyAttributes(allItems) {
+		var hasAA =
+			allItems.length > 0 && Object.hasOwn(allItems[0], "academyAttributes");
+		if (hasAA) return Promise.resolve();
+
+		var sid = getUtasSid();
+		if (!sid) return Promise.resolve();
+
+		return new Promise((resolve) => {
+			var PAGE_SIZE = 200;
+			var allRawItems = [];
+
+			function fetchPage(start) {
+				var body = JSON.stringify({
+					count: PAGE_SIZE,
+					start: start,
+					sortBy: "ovr",
+					sort: "desc",
+					type: "player",
+					searchAltPositions: true,
+				});
+				GM_xmlhttpRequest({
+					method: "POST",
+					url: EA + GAME + "/club",
+					headers: { "Content-Type": "application/json", "X-UT-SID": sid },
+					data: body,
+					timeout: 30000,
+					onload: (r) => {
+						if (r.status !== 200) {
+							log("  enrich HTTP " + r.status, "warn");
+							finish();
+							return;
+						}
+						try {
+							var resp = JSON.parse(r.responseText);
+							var items = resp.items || resp.itemData || [];
+							allRawItems = allRawItems.concat(items);
+							if (items.length >= PAGE_SIZE) {
+								fetchPage(start + PAGE_SIZE);
+							} else {
+								finish();
+							}
+						} catch (e) {
+							log("  enrich 解析失败: " + e.message, "warn");
+							finish();
+						}
+					},
+					onerror: () => {
+						log("  enrich 网络错误", "warn");
+						finish();
+					},
+					ontimeout: () => {
+						log("  enrich 超时", "warn");
+						finish();
+					},
+				});
+			}
+
+			function finish() {
+				var aaMap = {};
+				allRawItems.forEach((it) => {
+					if (it.academyAttributes && it.academyAttributes.length > 0) {
+						aaMap[it.id] = it.academyAttributes;
+					}
+				});
+				var enriched = 0;
+				allItems.forEach((it) => {
+					if (aaMap[it.id]) {
+						it.academyAttributes = aaMap[it.id];
+						enriched++;
+					}
+				});
+				log(
+					"已补充 " +
+						enriched +
+						" 名球员的 已进化特技（共扫描 " +
+						allRawItems.length +
+						" 人）",
+					"ok",
+				);
+				resolve();
+			}
+
+			fetchPage(0);
+		});
+	}
+
+	function processPlayers(allItems) {
+		// "all" = show every card type; otherwise restrict to selected rareflags
+		var allMode = selRarities.has("all");
+		var rfList = [];
+		if (!allMode) {
+			selRarities.forEach((key) => {
+				RARITY_OPTIONS.forEach((r) => {
+					if (r.key === key) rfList.push(r.rf);
+				});
+			});
+		}
+		var rfSet = new Set(rfList);
+
+		rfList.forEach((rf) => {
+			var cnt = 0;
+			allItems.forEach((it) => {
+				if (it.rareflag === rf) cnt++;
+			});
+		});
+
+		var filtered = allMode
+			? allItems
+			: allItems.filter((it) => rfSet.has(it.rareflag));
+
+		var posCount = {};
+		POS_GROUPS.forEach((g) => {
+			posCount[g.name] = 0;
+		});
+
+		filtered.forEach((it) => {
+			var code = it.preferredPosition;
+			var posName = typeof code === "string" ? code : posCodeToName(code);
+			var gp = null;
+			for (var i = 0; i < POS_GROUPS.length; i++) {
+				if (POS_GROUPS[i].positions.indexOf(posName) !== -1) {
+					gp = POS_GROUPS[i].name;
+					break;
+				}
+			}
+			if (gp) posCount[gp]++;
+		});
+		players = filtered.map((it) => {
+			// Filter academyAttributes: exclude id=0 and id=1, sort gold (totalBonus=2) first
+			var rawAttrs = it.academyAttributes || [];
+			var filteredAttrs = rawAttrs.filter((a) => a.id !== 0 && a.id !== 1);
+			filteredAttrs.sort((a, b) => b.totalBonus - a.totalBonus); // gold first
+			// All traits: native card traits + other evolutions + academy evos
+			var allTraits = readPlayerTraits(it);
+
+			// Resolve name: try _staticData first (has name/firstName/lastName), then other fields
+			var sd = it._staticData || {};
+			var resolvedName =
+				sd.name ||
+				sd.knownAs ||
+				it.displayName ||
+				it.name ||
+				it._name ||
+				it.commonName ||
+				"";
+			if (!resolvedName && (sd.firstName || it.firstName)) {
+				var fn = sd.firstName || it.firstName || "";
+				var ln = sd.lastName || it.lastName || "";
+				resolvedName = (ln + " " + fn).trim();
+			}
+			// Try to get guidAssetId from various sources (raw API field for EA CDN image URL)
+			var guidAssetId =
+				it.guidAssetId || it._guidAssetId || sd.guidAssetId || null;
+			// Also check _staticData.assetId for non-zero value (service layer gives 0 for _assetId)
+			var realAssetId = it._assetId || it.assetId;
+			if (
+				(!realAssetId || realAssetId === 0) &&
+				sd.assetId &&
+				sd.assetId !== 0
+			) {
+				realAssetId = sd.assetId;
+			}
+
+			return {
+				id: it.id,
+				resourceId: it.definitionId || it.resourceId,
+				assetId: realAssetId,
+				guidAssetId: guidAssetId,
+				iconId: it.iconId || it.headshotId || it.headshotAssetId || null,
+				rating: it.rating || it._rating,
+				position:
+					typeof it.preferredPosition === "string"
+						? it.preferredPosition
+						: posCodeToName(it.preferredPosition),
+				rf: it.rareflag,
+				academyAttributes: filteredAttrs,
+				allTraits: allTraits,
+				name: resolvedName,
+				_staticData: it._staticData || null,
+				_metaData: it._metaData || null,
+				_raw: it,
+			};
+		});
+
+		players.sort((a, b) => b.rating - a.rating);
+
+		var newActive = null;
+		POS_GROUPS.forEach((g) => {
+			if (!newActive && posCount[g.name] > 0) newActive = g.name;
+		});
+		if (newActive) activeTab = newActive;
+
+		loadPlayerNames().then(() => {
+			renderAll();
+			saveConfigToStorage();
+		});
+	}
+
+	function loadPlayerNames() {
+		var needNames = players.filter((p) => !p.name || p.name === "");
+		var needGuid = players.filter((p) => !p.guidAssetId);
+		log(
+			"解析名称头像: 缺名字 " +
+				needNames.length +
+				" 人, 缺头像 " +
+				needGuid.length +
+				" 人, 总 " +
+				players.length +
+				" 人",
+			"info",
+		);
+
+		try {
+			var uw = unsafeWindow;
+			var repos = uw.repositories;
+
+			// Approach 1: repos.Item.staticData — get guidAssetId + names
+			if (
+				repos &&
+				repos.Item &&
+				repos.Item.staticData &&
+				typeof repos.Item.staticData.get === "function"
+			) {
+				var sdRepo = repos.Item.staticData;
+				var nameCount = 0,
+					iconCount = 0,
+					guidCount = 0,
+					hitCount = 0;
+				players.forEach((p) => {
+					try {
+						var d = sdRepo.get(p.resourceId) || sdRepo.get(p.id);
+						if (d) {
+							hitCount++;
+							var n = d.name || d.knownAs || "";
+							if (!n && d.firstName)
+								n = d.lastName ? d.lastName + " " + d.firstName : d.firstName;
+							if (n && (!p.name || p.name === "")) {
+								p.name = n;
+								nameCount++;
+							}
+							var icon =
+								d.iconId || d.headshotId || d.headshotAssetId || d.portraitId;
+							if (icon && !p.iconId) {
+								p.iconId = icon;
+								iconCount++;
+							}
+							var gid = d.guidAssetId;
+							if (gid && !p.guidAssetId) {
+								p.guidAssetId = gid;
+								guidCount++;
+							}
+						}
+					} catch (e2) {}
+				});
+				log(
+					"  staticData: " +
+						hitCount +
+						" 命中, " +
+						nameCount +
+						" 名字, " +
+						guidCount +
+						" 头像",
+					"info",
+				);
+				if (nameCount >= needNames.length && needGuid.length === 0) {
+					log("名称头像解析完成", "ok");
+					return Promise.resolve();
+				}
+			}
+
+			// Approach 2: repositories.Item.club items — try to get names from club items
+			if (repos && repos.Item && repos.Item.club) {
+				var clubItems = repos.Item.club.items;
+				if (clubItems && typeof clubItems.values === "function") {
+					var vals = clubItems.values();
+					if (vals) {
+						var arr = [];
+						if (typeof Symbol !== "undefined" && vals[Symbol.iterator])
+							arr = Array.from(vals);
+						log("  club items: " + arr.length + " 条", "info");
+						if (arr.length > 0) {
+							var nameMap = {};
+							arr.forEach((item) => {
+								var n =
+									item.name ||
+									item._name ||
+									item.playerName ||
+									item.commonName ||
+									"";
+								if (!n && item.firstName)
+									n = item.lastName
+										? item.lastName + " " + item.firstName
+										: item.firstName;
+								if (n) nameMap[item.id] = n;
+							});
+							var fromPage = 0;
+							needNames.forEach((p) => {
+								if (nameMap[p.id]) {
+									p.name = nameMap[p.id];
+									fromPage++;
+								}
+							});
+							log(
+								"  club items 匹配名字: " + fromPage + "/" + needNames.length,
+								"info",
+							);
+							if (fromPage > 0) {
+								if (fromPage >= needNames.length) {
+									log("名称头像解析完成(club)", "ok");
+									return Promise.resolve();
+								}
+							}
+						}
+					}
+				}
+			}
+		} catch (e) {
+			log("读取页面数据失败: " + e.message, "warn");
+		}
+
+		// Fallback: GM cache
+		var cache = {};
+		try {
+			cache = JSON.parse(GM_getValue("fc-player-names-v2", "{}"));
+		} catch (e) {}
+
+		var fromCache = 0;
+		needNames.forEach((p) => {
+			if (cache[p.resourceId]) {
+				p.name = cache[p.resourceId];
+				fromCache++;
+			}
+		});
+		if (fromCache >= needNames.length) {
+			return Promise.resolve();
+		}
+
+		// Fallback: fut.to (may return 0 names)
+		return new Promise((resolve) => {
+			GM_xmlhttpRequest({
+				method: "GET",
+				url: "https://api.fut.to/26/playermeta.json",
+				timeout: 15000,
+				onload: (r) => {
+					try {
+						var meta = JSON.parse(r.responseText);
+						var loaded = 0;
+						needNames.forEach((p) => {
+							if (!p.name || p.name === "") {
+								var info = meta[p.resourceId];
+								if (info && info[2]) {
+									p.name = info[2];
+									cache[p.resourceId] = info[2];
+									loaded++;
+								}
+							}
+						});
+						GM_setValue("fc-player-names-v2", JSON.stringify(cache));
+					} catch (e) {
+						log("fut.to 解析失败: " + e.message, "warn");
+					}
+					resolve();
+				},
+				onerror: () => {
+					log("fut.to 不可用", "warn");
+					resolve();
+				},
+				ontimeout: () => {
+					log("fut.to 超时", "warn");
+					resolve();
+				},
+			});
+		});
+	}
+
+	function showLoading() {
+		var el = $("fc-batch-loading");
+		if (el) el.classList.add("show");
+	}
+	function hideLoading() {
+		var el = $("fc-batch-loading");
+		if (el) el.classList.remove("show");
+	}
+
+	function doFullDataLoad() {
+		if (dataLoaded) return;
+		dataLoaded = true;
+		showLoading();
+		log("开始加载数据...", "info");
+
+		loadHubAndSlots()
+			.then(() => loadClubPlayers())
+			.then((allItems) => {
+				allItemsCache = allItems;
+				processFromCache(allItems);
+			})
+			.catch((e) => {
+				log("加载失败: " + e.message, "err");
+				$("fc-batch-player-list").innerHTML =
+					'<div class="fc-empty" style="color:#f87171">加载失败: ' +
+					esc(e.message) +
+					"<br>请检查网络后点击刷新重试</div>";
+				dataLoaded = false;
+				hideLoading();
+			});
+	}
+
+	function processFromCache(allItems) {
+		processPlayers(allItems);
+		var validIds = {};
+		players.forEach((p) => {
+			validIds[p.id] = true;
+		});
+		[playerGoldPs, playerSilverPs].forEach((store) => {
+			Object.keys(store).forEach((k) => {
+				if (!validIds[parseInt(k)]) delete store[k];
+			});
+		});
+		selPlayers.clear();
+		saveConfigToStorage();
+		hideLoading();
+	}
+
+	function refilterPlayers() {
+		if (!allItemsCache) {
+			doFullDataLoad();
+			return;
+		}
+		processFromCache(allItemsCache);
+	}
+
+	// ═══════════════ EVOLUTION EXECUTION ═══════════════
+	function applyEvo(itemId, slotId) {
+		return new Promise((resolve, reject) => {
+			var sid = getUtasSid();
+			if (!sid) {
+				reject(new Error("无法获取 UT 会话令牌"));
+				return;
+			}
+			GM_xmlhttpRequest({
+				method: "POST",
+				url: EA + GAME + "/academy/slots",
+				headers: { "Content-Type": "application/json", "X-UT-SID": sid },
+				data: JSON.stringify({
+					currency: null,
+					itemId: itemId,
+					slotId: slotId,
+				}),
+				onload: (resp) => {
+					if (resp.status >= 200 && resp.status < 300) {
+						resolve();
+					} else {
+						var errText = (resp.responseText || "").substring(0, 200);
+						reject(new Error(resp.status + ": " + errText));
+					}
+				},
+				onerror: () => {
+					reject(new Error("Network error"));
+				},
+				ontimeout: () => {
+					reject(new Error("Timeout"));
+				},
+				timeout: 15000,
+			});
+		});
+	}
+
+	async function applyEvoWithRetry(itemId, slotId) {
+		for (var attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+			try {
+				await applyEvo(itemId, slotId);
+				return;
+			} catch (e) {
+				if (attempt >= MAX_RETRIES) throw e;
+				log("  重试 " + attempt + "/" + MAX_RETRIES + "...", "warn");
+				await delay(1500);
+			}
+		}
+	}
+
+	// ═══════════════ EXECUTION ENGINE ═══════════════
+	function buildQueue() {
+		queue = [];
+		selPlayers.forEach((pid) => {
+			var effective = getEffectiveSlots(pid);
+			effective.gold.forEach((sid) => {
+				var key = pid + ":" + sid;
+				if (!completedEvo[key]) queue.push({ pid: pid, sid: sid });
+			});
+			effective.silver.forEach((sid) => {
+				var key = pid + ":" + sid;
+				if (!completedEvo[key]) queue.push({ pid: pid, sid: sid });
+			});
+		});
+		qi = 0;
+	}
+
+	async function runExec() {
+		if (running || queue.length === 0) return;
+		running = true;
+		wasStopped = false;
+		stopFlag = false;
+		updateBtns();
+		for (; qi < queue.length; qi++) {
+			if (stopFlag) break;
+			var t = queue[qi];
+			var p = null;
+			for (var i = 0; i < players.length; i++) {
+				if (players[i].id === t.pid) {
+					p = players[i];
+					break;
+				}
+			}
+			var s = slotById(t.sid);
+			var sn = s ? s.slotName : "ID:" + t.sid;
+			var pn = p && p.name ? p.name : "#" + (p ? p.resourceId : t.pid);
+			renderProgress();
+			try {
+				await applyEvoWithRetry(t.pid, t.sid);
+				completedEvo[t.pid + ":" + t.sid] = true;
+				log(pn + " ← " + sn + " ✅", "ok");
+			} catch (ex) {
+				log(pn + " ← " + sn + " ❌ " + (ex.message || ""), "err");
+			}
+			renderProgress();
+			if (qi < queue.length - 1 && !stopFlag) await delay(randomInterval());
+		}
+		if (stopFlag) {
+			log("已中止 (已完成 " + qi + "/" + queue.length + ")", "warn");
+			wasStopped = true;
+		} else {
+			log("全部完成！共 " + queue.length + " 次进化", "ok");
+			queue = [];
+			qi = 0;
+			wasStopped = false;
+			completedEvo = {};
+			selPlayers.clear();
+			saveConfigToStorage();
+			renderPlayerList();
+			renderSummary();
+		}
+		running = false;
+		stopFlag = false;
+		updateBtns();
+		renderProgress();
+	}
+
+	function startExec() {
+		if (wasStopped) {
+			// Rebuild queue from current selections, skipping completed items
+			buildQueue();
+			if (queue.length === 0) {
+				log("没有待执行的进化", "warn");
+				wasStopped = false;
+				completedEvo = {};
+				updateBtns();
+				return;
+			}
+			log(
+				"继续执行 " +
+					queue.length +
+					" 次进化 (间隔 " +
+					EXEC_INTERVAL / 1000 +
+					"s)...",
+				"info",
+			);
+			qi = 0;
+			wasStopped = false;
+			runExec();
+			return;
+		}
+		completedEvo = {};
+		buildQueue();
+		if (queue.length === 0) {
+			log("请先选择球员和特技", "warn");
+			return;
+		}
+		qi = 0;
+		log(
+			"开始执行 " +
+				queue.length +
+				" 次进化 (间隔 " +
+				EXEC_INTERVAL_MIN / 1000 +
+				"-" +
+				EXEC_INTERVAL_MAX / 1000 +
+				"s 随机)...",
+			"info",
+		);
+		runExec();
+	}
+	function stopExec() {
+		stopFlag = true;
+	}
+
+	function updateBtns() {
+		var sb = $("fc-batch-btn-start");
+		if (!sb) return;
+		if (running) {
+			sb.textContent = "⏹ 停止进化";
+			sb.className = "fc-btn fc-btn-red";
+		} else if (wasStopped) {
+			sb.textContent = "▶ 继续进化 (" + (queue.length - qi) + " 次)";
+			sb.className = "fc-btn fc-btn-primary";
+		} else {
+			sb.textContent =
+				queue.length > 0
+					? "▶ 执行进化 (" + queue.length + " 次)"
+					: "▶ 执行进化";
+			sb.className = "fc-btn fc-btn-primary";
+		}
+	}
+
+	// ═══════════════ APPLY / CLEAR LOGIC ═══════════════
+	function applyGroupToPlayers() {
+		var gGold = groupGoldPs[activeTab] || [];
+		var gSilver = groupSilverPs[activeTab] || [];
+		var gGoldTraitIds = slotIdsToTraitIds(gGold);
+		var gSilverTraitIds = slotIdsToTraitIds(gSilver);
+		var applied = 0,
+			skipped = 0;
+
+		players.forEach((p) => {
+			if (getPosGroup(p) !== activeTab) return;
+
+			// No traits at all → apply full group as-is; otherwise filter out
+			// traits the player already has (native or from other evolutions).
+			if (traitSource(p).length === 0) {
+				playerGoldPs[p.id] = gGold.slice();
+				playerSilverPs[p.id] = gSilver.slice();
+				applied++;
+				return;
+			}
+
+			// Gather existing trait IDs by type (all traits: native + other evos + academy)
+			var existingGoldIds = [];
+			var existingSilverIds = [];
+			traitSource(p).forEach((a) => {
+				if (a.totalBonus === 2) existingGoldIds.push(a.id);
+				else if (a.totalBonus === 1) existingSilverIds.push(a.id);
+			});
+
+			// Filter group traits: exclude traits the player already has
+			var newGold = gGold.filter((sid) => {
+				var s = slotById(sid);
+				return s && existingGoldIds.indexOf(s.traitId) === -1;
+			});
+			var newSilver = gSilver.filter((sid) => {
+				var s = slotById(sid);
+				return s && existingSilverIds.indexOf(s.traitId) === -1;
+			});
+			var newGoldIds = slotIdsToTraitIds(newGold);
+			var newSilverIds = slotIdsToTraitIds(newSilver);
+
+			// --- Gold: subset check + count check ---
+			var goldTotal = existingGoldIds.length + newGoldIds.length;
+			var goldSubset = existingGoldIds.every(
+				(id) => gGoldTraitIds.indexOf(id) !== -1,
+			);
+			var goldOk =
+				gGoldTraitIds.length === 0 || (goldSubset && goldTotal <= MAX_GOLD);
+
+			// --- Silver: subset check + count check ---
+			var silverTotal = existingSilverIds.length + newSilverIds.length;
+			var silverSubset = existingSilverIds.every(
+				(id) => gSilverTraitIds.indexOf(id) !== -1,
+			);
+			var silverOk =
+				gSilverTraitIds.length === 0 ||
+				(silverSubset && silverTotal <= MAX_SILVER);
+
+			if (!goldOk && !silverOk) {
+				skipped++;
+				var parts = [];
+				if (gGoldTraitIds.length > 0 && existingGoldIds.length > 0) {
+					var goldNames = existingGoldIds
+						.map((id) => {
+							var s = slotByTraitId(id);
+							return traitDisplayName(s ? s.slotName : "ID:" + id, true);
+						})
+						.join("/");
+					parts.push("金特技" + goldNames);
+				}
+				if (gSilverTraitIds.length > 0 && existingSilverIds.length > 0) {
+					var silverNames = existingSilverIds
+						.map((id) => {
+							var s = slotByTraitId(id);
+							return traitDisplayName(s ? s.slotName : "ID:" + id, false);
+						})
+						.join("/");
+					parts.push("银特技" + silverNames);
+				}
+				if (parts.length === 0) parts.push("不兼容的特技");
+				var groupGoldNames = gGoldTraitIds
+					.map((id) => {
+						var s = slotByTraitId(id);
+						return traitDisplayName(s ? s.slotName : "?", true);
+					})
+					.join("/");
+				var groupSilverNames = gSilverTraitIds
+					.map((id) => {
+						var s = slotByTraitId(id);
+						return traitDisplayName(s ? s.slotName : "?", false);
+					})
+					.join("/");
+				var groupStr = [];
+				if (gGoldTraitIds.length > 0) groupStr.push("金" + groupGoldNames);
+				if (gSilverTraitIds.length > 0) groupStr.push("银" + groupSilverNames);
+				log(
+					p.name +
+						" 已有" +
+						parts.join("、") +
+						"，无法应用分组特技" +
+						groupStr.join("、") +
+						"，请手动配置",
+					"warn",
+				);
+				return;
+			}
+
+			if (!goldOk) {
+				var gNames = existingGoldIds
+					.map((id) => {
+						var s = slotByTraitId(id);
+						return traitDisplayName(s ? s.slotName : "ID:" + id, true);
+					})
+					.join("/");
+				log(
+					p.name +
+						" 已有金特技" +
+						gNames +
+						"，与分组金特技不兼容，已跳过金特技应用",
+					"warn",
+				);
+				playerSilverPs[p.id] = newSilver;
+			} else if (!silverOk) {
+				var sNames = existingSilverIds
+					.map((id) => {
+						var s = slotByTraitId(id);
+						return traitDisplayName(s ? s.slotName : "ID:" + id, false);
+					})
+					.join("/");
+				log(
+					p.name +
+						" 已有银特技" +
+						sNames +
+						"，与分组银特技不兼容，已跳过银特技应用",
+					"warn",
+				);
+				playerGoldPs[p.id] = newGold;
+			} else {
+				playerGoldPs[p.id] = newGold;
+				playerSilverPs[p.id] = newSilver;
+			}
+			applied++;
+		});
+
+		saveConfigToStorage();
+		groupApplied[activeTab] = true;
+		if (skipped > 0) {
+			log(
+				"已应用分组模板到 " + applied + " 名球员 (" + skipped + " 名无法应用)",
+				"ok",
+			);
+		} else {
+			log("已应用分组模板到 " + applied + " 名球员", "ok");
+		}
+		renderPlayerList();
+		renderSummary();
+	}
+
+	function clearGroupFromPlayers() {
+		var cleared = 0;
+		players.forEach((p) => {
+			if (getPosGroup(p) !== activeTab) return;
+			var hadAny =
+				(playerGoldPs[p.id] && playerGoldPs[p.id].length > 0) ||
+				(playerSilverPs[p.id] && playerSilverPs[p.id].length > 0);
+			if (hadAny) cleared++;
+			playerGoldPs[p.id] = [];
+			playerSilverPs[p.id] = [];
+		});
+		saveConfigToStorage();
+		groupApplied[activeTab] = false;
+		log(
+			"已重置 " + cleared + " 名球员的个人特技配置 (已有进化特技不受影响)",
+			"ok",
+		);
+		renderPlayerList();
+		renderSummary();
+	}
+
+	// ═══════════════ DROPDOWN COMPONENT ═══════════════
+
+	// Convert slot IDs to trait IDs
+	function slotIdsToTraitIds(sids) {
+		var result = [];
+		sids.forEach((sid) => {
+			var s = slotById(sid);
+			if (s) result.push(s.traitId);
+		});
+		return result;
+	}
+
+	function getDropdownInfo() {
+		if (ddType === "group-gold") {
+			return {
+				slots: goldSlots,
+				selected: groupGoldPs[activeTab] || [],
+				locked: [],
+				exclusive: [],
+				maxSlots: MAX_GOLD,
+				label: activeTab + " 金特技",
+			};
+		}
+		if (ddType === "group-silver") {
+			var oppTraitIds = slotIdsToTraitIds(groupGoldPs[activeTab] || []);
+			var exclusive = [];
+			silverSlots.forEach((s) => {
+				if (oppTraitIds.indexOf(s.traitId) !== -1) exclusive.push(s.id);
+			});
+			return {
+				slots: silverSlots,
+				selected: groupSilverPs[activeTab] || [],
+				locked: [],
+				exclusive: exclusive,
+				maxSlots: MAX_SILVER,
+				label: activeTab + " 银特技",
+			};
+		}
+
+		// Player dropdowns: ddType = 'player-{pid}-gold' or 'player-{pid}-silver'
+		var m = ddType.match(/^player-(\d+)-(gold|silver)$/);
+		if (!m) return null;
+		var pid = parseInt(m[1]);
+		var isGold = m[2] === "gold";
+
+		var p = null;
+		for (var i = 0; i < players.length; i++) {
+			if (players[i].id === pid) {
+				p = players[i];
+				break;
+			}
+		}
+		if (!p) return null;
+
+		var slots = isGold ? goldSlots : silverSlots;
+		var maxSlots = isGold ? MAX_GOLD : MAX_SILVER;
+		var existingCount = isGold
+			? getAcademyGoldCount(p)
+			: getAcademySilverCount(p);
+		var effectiveMax = maxSlots - existingCount;
+
+		var selected = isGold ? playerGoldPs[pid] || [] : playerSilverPs[pid] || [];
+
+		var lockedIds = [];
+		var exclusiveIds = [];
+		var existingGoldTraitIds = [];
+		var existingSilverTraitIds = [];
+		traitSource(p).forEach((a) => {
+			if (a.totalBonus === 2) existingGoldTraitIds.push(a.id);
+			else existingSilverTraitIds.push(a.id);
+		});
+		var sameTypeExisting = isGold
+			? existingGoldTraitIds
+			: existingSilverTraitIds;
+
+		slots.forEach((s) => {
+			// Same-type already evolved → locked
+			if (sameTypeExisting.indexOf(s.traitId) !== -1) lockedIds.push(s.id);
+		});
+
+		// Gold: no mutual exclusion with silver. Silver: exclude opposite-type existing & planned.
+		if (!isGold) {
+			var oppPlanned = playerGoldPs[pid] || [];
+			var oppPlannedTraitIds = slotIdsToTraitIds(oppPlanned);
+			var oppTypeExisting = existingGoldTraitIds;
+			slots.forEach((s) => {
+				if (lockedIds.indexOf(s.id) !== -1) return;
+				if (oppTypeExisting.indexOf(s.traitId) !== -1) exclusiveIds.push(s.id);
+				else if (oppPlannedTraitIds.indexOf(s.traitId) !== -1)
+					exclusiveIds.push(s.id);
+			});
+		}
+
+		var displayName = p.name || "#" + p.resourceId;
+		return {
+			slots: slots,
+			selected: selected,
+			locked: lockedIds,
+			exclusive: exclusiveIds,
+			maxSlots: effectiveMax,
+			label: displayName + " " + (isGold ? "金" : "银") + "特技",
+		};
+	}
+
+	function openDropdown(type) {
+		if (ddOpen && ddType === type) {
+			closeDropdown();
+			return;
+		}
+		ddOpen = true;
+		ddType = type;
+		renderDropdown();
+	}
+
+	function closeDropdown() {
+		ddOpen = false;
+		ddType = null;
+		var dd = $("fc-dd");
+		if (dd) dd.style.display = "none";
+		var rb = $("fc-rarity-btn");
+		if (rb) rb.classList.remove("active");
+		var allTriggers = document.querySelectorAll(".fc-dd-trigger");
+		allTriggers.forEach((t) => {
+			t.classList.remove("active");
+		});
+	}
+
+	function renderDropdown() {
+		var dd = $("fc-dd");
+		if (!dd) return;
+
+		if (!ddOpen) {
+			dd.style.display = "none";
+			return;
+		}
+
+		var info = getDropdownInfo();
+		if (!info) {
+			closeDropdown();
+			return;
+		}
+
+		// Compute max slot name length for uniform item width
+		var maxLen = 0;
+		info.slots.forEach((s) => {
+			if (s.slotName.length > maxLen) maxLen = s.slotName.length;
+		});
+		var itemWidth = Math.max(maxLen * 9 + 30, 80); // ~9px per char + checkbox
+
+		var h =
+			'<div class="fc-dd-header">' +
+			esc(info.label) +
+			" (" +
+			info.selected.length +
+			"/" +
+			info.maxSlots +
+			")" +
+			'<span class="fc-dd-close" id="fc-dd-close">✕</span></div>';
+		h += '<div class="fc-dd-list">';
+
+		if (info.slots.length === 0) {
+			h += '<div class="fc-dd-empty">暂无可用特技</div>';
+		} else {
+			info.slots.forEach((s) => {
+				var isLocked = (info.locked || []).indexOf(s.id) !== -1;
+				var isExclusive = (info.exclusive || []).indexOf(s.id) !== -1;
+				var isSelected = info.selected.indexOf(s.id) !== -1;
+				var isBlocked = isLocked || isExclusive;
+				var atMax =
+					!isSelected && !isBlocked && info.selected.length >= info.maxSlots;
+
+				var cls = "fc-dd-item";
+				if (isLocked) cls += " locked";
+				else if (isExclusive) cls += " exclusive";
+				else if (isSelected) cls += " selected";
+				else if (atMax) cls += " disabled";
+
+				h +=
+					'<div class="' +
+					cls +
+					'" data-sid="' +
+					s.id +
+					'" style="min-width:' +
+					itemWidth +
+					'px">';
+				h += '<span class="fc-dd-chk">';
+				if (isLocked) h += "🔒";
+				else if (isExclusive || isSelected) h += "✓";
+				h += "</span>";
+				h += '<span class="fc-dd-name">' + esc(s.slotName) + "</span>";
+				h += "</div>";
+			});
+		}
+		h += "</div>";
+
+		dd.innerHTML = h;
+		dd.style.display = "block";
+
+		// Bind close button
+		var closeBtn = $("fc-dd-close");
+		if (closeBtn)
+			closeBtn.addEventListener("click", (e) => {
+				e.stopPropagation();
+				closeDropdown();
+			});
+
+		// Position near the trigger button
+		setTimeout(() => {
+			var anchor = document.querySelector('[data-dd="' + ddType + '"]');
+			if (!anchor) anchor = document.querySelector(".fc-dd-trigger.active");
+			if (anchor) {
+				var rect = anchor.getBoundingClientRect();
+				var ddH = Math.min(dd.offsetHeight, 360);
+				var spaceBelow = window.innerHeight - rect.bottom;
+				var spaceAbove = rect.top;
+				var maxH;
+				if (spaceBelow >= ddH + 8) {
+					dd.style.top = rect.bottom + 4 + "px";
+					maxH = spaceBelow - 8;
+				} else if (spaceAbove >= 160) {
+					var top = rect.top - ddH - 4;
+					if (top < 4) top = 4;
+					dd.style.top = top + "px";
+					maxH = spaceAbove - 8;
+				} else {
+					dd.style.top = Math.max(4, (window.innerHeight - ddH) / 2) + "px";
+					maxH = window.innerHeight - 16;
+				}
+				dd.style.maxHeight = Math.min(maxH, 360) + "px";
+				dd.style.left =
+					Math.min(
+						Math.max(rect.left, 4),
+						window.innerWidth - dd.offsetWidth - 4,
+					) + "px";
+			}
+		}, 10);
+	}
+
+	function handleDropdownClick(sid) {
+		var info = getDropdownInfo();
+		if (!info) return;
+
+		// Block locked (already evolved) and exclusive (mutual exclusion) items
+		if ((info.locked || []).indexOf(sid) !== -1) return;
+		if ((info.exclusive || []).indexOf(sid) !== -1) return;
+
+		var isSelected = info.selected.indexOf(sid) !== -1;
+		if (!isSelected && info.selected.length >= info.maxSlots) return;
+
+		// Determine what to update
+		if (ddType === "group-gold") {
+			if (!groupGoldPs[activeTab]) groupGoldPs[activeTab] = [];
+			if (isSelected) {
+				groupGoldPs[activeTab] = groupGoldPs[activeTab].filter(
+					(s) => s !== sid,
+				);
+			} else {
+				groupGoldPs[activeTab].push(sid);
+			}
+			groupApplied[activeTab] = false;
+			saveConfigToStorage();
+			renderDropdown();
+			renderGroupConfig();
+		} else if (ddType === "group-silver") {
+			if (!groupSilverPs[activeTab]) groupSilverPs[activeTab] = [];
+			if (isSelected) {
+				groupSilverPs[activeTab] = groupSilverPs[activeTab].filter(
+					(s) => s !== sid,
+				);
+			} else {
+				groupSilverPs[activeTab].push(sid);
+			}
+			groupApplied[activeTab] = false;
+			saveConfigToStorage();
+			renderDropdown();
+			renderGroupConfig();
+		} else {
+			// Player dropdown
+			var m = ddType.match(/^player-(\d+)-(gold|silver)$/);
+			if (!m) return;
+			var pid = parseInt(m[1]);
+			var isGold = m[2] === "gold";
+			var storage = isGold ? playerGoldPs : playerSilverPs;
+			if (!storage[pid]) storage[pid] = [];
+			if (isSelected) {
+				storage[pid] = storage[pid].filter((s) => s !== sid);
+			} else {
+				storage[pid].push(sid);
+			}
+			saveConfigToStorage();
+			// Render player list FIRST, then dropdown — so the trigger exists for positioning
+			renderPlayerList();
+			renderSummary();
+			renderGroupConfig();
+			// Restore active class on the re-created trigger
+			var newTrigger = document.querySelector('[data-dd="' + ddType + '"]');
+			if (newTrigger) newTrigger.classList.add("active");
+			renderDropdown();
+		}
+	}
+
+	// ═══════════════ RENDER ═══════════════
+	function renderAll() {
+		renderRarityFilter();
+		renderTabs();
+		renderGroupConfig();
+		renderPlayerList();
+		renderSummary();
+	}
+
+	function renderRarityFilter() {
+		var btn = $("fc-rarity-btn");
+		if (!btn) return;
+		var allMode = selRarities.has("all");
+		var count = allMode ? "全部" : selRarities.size;
+		btn.innerHTML =
+			'稀有度 <span class="fc-rarity-count">(' + count + ")</span> ▼";
+
+		// Update hideCompleted chip state
+		var hc = $("fc-chip-hide-completed");
+		if (hc) {
+			if (hideCompleted) {
+				hc.classList.add("on");
+				hc.querySelector(".fc-chk").textContent = "✓";
+			} else {
+				hc.classList.remove("on");
+				hc.querySelector(".fc-chk").textContent = "";
+			}
+		}
+	}
+
+	function openRarityDropdown() {
+		var dd = $("fc-dd");
+		if (!dd) return;
+		ddOpen = true;
+		ddType = "rarity";
+		var btn = $("fc-rarity-btn");
+		if (btn) btn.classList.add("active");
+
+		var h = '<div class="fc-dd-header-row">';
+		h += '<span class="fc-dd-title">选择稀有度</span>';
+		h +=
+			'<button class="fc-btn fc-btn-sm fc-btn-primary" id="fc-rarity-confirm">确认</button>';
+		h += "</div>";
+		h += '<div class="fc-rarity-grid">';
+		RARITY_OPTIONS.forEach((r) => {
+			var ck = selRarities.has(r.key);
+			h +=
+				'<div class="fc-rarity-item' +
+				(ck ? " on" : "") +
+				'" data-rk="' +
+				r.key +
+				'">' +
+				'<span class="fc-chk">' +
+				(ck ? "✓" : "") +
+				"</span>" +
+				r.label +
+				"</div>";
+		});
+		h += "</div>";
+		dd.innerHTML = h;
+
+		// Position dropdown near the rarity button
+		var rect = btn.getBoundingClientRect();
+		dd.style.top = rect.bottom + 4 + "px";
+		dd.style.left = Math.min(rect.left, window.innerWidth - 220) + "px";
+		dd.style.display = "block";
+
+		$("fc-rarity-confirm").addEventListener("click", (e) => {
+			e.stopPropagation();
+			closeDropdown();
+			renderRarityFilter();
+			refilterPlayers();
+		});
+	}
+
+	function handleRarityClick(rk) {
+		if (rk === "all") {
+			// Selecting 全部球员 clears specific selections
+			selRarities.clear();
+			selRarities.add("all");
+		} else {
+			// Selecting a specific rarity clears 全部球员 mode
+			selRarities.delete("all");
+			if (selRarities.has(rk)) selRarities.delete(rk);
+			else selRarities.add(rk);
+		}
+		saveConfigToStorage();
+		// Re-render dropdown items in place
+		var dd = $("fc-dd");
+		if (!dd) return;
+		var items = dd.querySelectorAll(".fc-rarity-item");
+		items.forEach((item) => {
+			var rk2 = item.getAttribute("data-rk");
+			var ck = selRarities.has(rk2);
+			if (ck) {
+				item.classList.add("on");
+				item.querySelector(".fc-chk").textContent = "✓";
+			} else {
+				item.classList.remove("on");
+				item.querySelector(".fc-chk").textContent = "";
+			}
+		});
+	}
+
+	function tabLabel(group) {
+		var label = group.label || group.name;
+		if (label.length > 5) label = label.substring(0, 4) + "…";
+		return label;
+	}
+
+	function renderTabs() {
+		var el = $("fc-batch-tabs");
+		if (!el) return;
+		var counts = {},
+			filteredCounts = {};
+		POS_GROUPS.forEach((g) => {
+			counts[g.name] = 0;
+			filteredCounts[g.name] = 0;
+		});
+		players.forEach((p) => {
+			var g = getPosGroup(p);
+			counts[g]++;
+			var full =
+				getAcademyGoldCount(p) >= MAX_GOLD &&
+				getAcademySilverCount(p) >= MAX_SILVER;
+			if (!full && !isCardLocked(p)) filteredCounts[g]++;
+		});
+
+		var h = "";
+		POS_GROUPS.forEach((g) => {
+			if (counts[g.name] === 0) return;
+			var isActive = activeTab === g.name;
+			h +=
+				'<div class="fc-tab' +
+				(isActive ? " active" : "") +
+				'" data-tab="' +
+				g.name +
+				'" title="' +
+				(g.label || g.name) +
+				'">' +
+				tabLabel(g) +
+				" (" +
+				filteredCounts[g.name] +
+				"/" +
+				counts[g.name] +
+				")</div>";
+		});
+		el.innerHTML = h;
+	}
+
+	function renderGroupConfig() {
+		var el = $("fc-batch-group-config");
+		if (!el) return;
+		var gGold = groupGoldPs[activeTab] || [];
+		var gSilver = groupSilverPs[activeTab] || [];
+
+		var h = "";
+		var cfgGroup = POS_GROUPS.find((g) => g.name === activeTab);
+		var cfgLabel = cfgGroup ? cfgGroup.label || cfgGroup.name : activeTab;
+		h += '<div class="fc-config-title">' + cfgLabel + " 分组特技模板</div>";
+		var hasGroupTraits = gGold.length > 0 || gSilver.length > 0;
+		var hasPlayerConfigs = false;
+		players.forEach((p) => {
+			if (getPosGroup(p) !== activeTab) return;
+			if (
+				(playerGoldPs[p.id] && playerGoldPs[p.id].length > 0) ||
+				(playerSilverPs[p.id] && playerSilverPs[p.id].length > 0)
+			) {
+				hasPlayerConfigs = true;
+			}
+		});
+		var isApplied = groupApplied[activeTab] || false;
+		var applyDisabled = !hasGroupTraits || isApplied || running;
+		var resetDisabled = (!hasPlayerConfigs && !isApplied) || running;
+		var applyCls =
+			"fc-btn fc-btn-sm " + (applyDisabled ? "fc-btn-gray" : "fc-btn-primary");
+		var resetCls =
+			"fc-btn fc-btn-sm " + (resetDisabled ? "fc-btn-gray" : "fc-btn-primary");
+
+		// ── 分组特技区域 ──
+		h += '<div class="fc-config-row">';
+		h += '<div class="fc-config-col">';
+		h +=
+			'<button class="fc-dd-trigger" data-dd="group-gold">金特技 (' +
+			gGold.length +
+			"/" +
+			MAX_GOLD +
+			") ▼</button>";
+		h += "</div>";
+		h += '<div class="fc-config-col">';
+		h +=
+			'<button class="fc-dd-trigger" data-dd="group-silver">银特技 (' +
+			gSilver.length +
+			"/" +
+			MAX_SILVER +
+			") ▼</button>";
+		h += "</div>";
+		h += '<div class="fc-config-col fc-config-actions">';
+		h +=
+			'<button class="' +
+			applyCls +
+			'" id="fc-btn-apply-group"' +
+			(applyDisabled ? " disabled" : "") +
+			">应用</button>";
+		h +=
+			'<button class="' +
+			resetCls +
+			'" id="fc-btn-clear-group"' +
+			(resetDisabled ? " disabled" : "") +
+			">重置</button>";
+		h += "</div>";
+		h += "</div>";
+
+		// 分组特技图标
+		if (gGold.length > 0 || gSilver.length > 0) {
+			h += '<div class="fc-config-chips">';
+			gGold.forEach((sid) => {
+				var s = slotById(sid);
+				var traitId = s ? s.traitId : null;
+				if (traitId != null) {
+					var label = s ? traitDisplayName(s.slotName, true) : "ID:" + traitId;
+					h +=
+						'<img class="fc-trait-icon" src="' +
+						_traitIconBase +
+						"icontrait" +
+						traitIconId(traitId) +
+						'.png" title="' +
+						esc(label) +
+						'" data-fc-name="' +
+						esc(label) +
+						'" data-fc-gold="1" onerror="_fcTraitImgErr(this)">';
+				}
+			});
+			gSilver.forEach((sid) => {
+				var s = slotById(sid);
+				var traitId = s ? s.traitId : null;
+				if (traitId != null) {
+					var label = s ? traitDisplayName(s.slotName, false) : "ID:" + traitId;
+					h +=
+						'<img class="fc-trait-icon" src="' +
+						_traitIconBase +
+						"basetrait" +
+						traitIconId(traitId) +
+						'.png" title="' +
+						esc(label) +
+						'" data-fc-name="' +
+						esc(label) +
+						'" data-fc-gold="0" onerror="_fcTraitImgErr(this)">';
+				}
+			});
+			h += "</div>";
+		}
+
+		// ── 球员搜索区域 ──
+		var groupPlayers = players.filter((p) => getPosGroup(p) === activeTab);
+		var eligible = groupPlayers.filter((p) => {
+			if (
+				getAcademyGoldCount(p) >= MAX_GOLD &&
+				getAcademySilverCount(p) >= MAX_SILVER
+			)
+				return false;
+			if (isCardLocked(p)) return false;
+			return true;
+		});
+		var allSelected =
+			eligible.length > 0 && eligible.every((p) => selPlayers.has(p.id));
+		var selBtnCls = "fc-btn fc-btn-sm fc-btn-gray";
+		if (allSelected) selBtnCls += " fc-sel-all-on";
+		h += '<div class="fc-player-toolbar">';
+		h +=
+			'<input id="fc-batch-search-group" placeholder="搜索球员..." style="width:160px;padding:5px 8px;border:1px solid rgba(59,130,246,0.2);border-radius:4px;background:rgba(0,0,0,0.3);color:#ddd;font-size:11px;outline:none">';
+		h += '<div class="fc-config-spacer" style="flex:1"></div>';
+		h +=
+			'<button class="' +
+			selBtnCls +
+			'" id="fc-btn-select-all">' +
+			(allSelected ? "✓ 全选" : "☐ 全选") +
+			" (" +
+			eligible.length +
+			")</button>";
+		h += "</div>";
+
+		el.innerHTML = h;
+
+		// Bind search input
+		var searchEl = $("fc-batch-search-group");
+		if (searchEl) searchEl.addEventListener("input", renderPlayerList);
+
+		// Bind Apply/Clear/SelectAll buttons
+		var btnApply = $("fc-btn-apply-group");
+		var btnClear = $("fc-btn-clear-group");
+		var btnSelectAll = $("fc-btn-select-all");
+		if (btnApply && !applyDisabled)
+			btnApply.addEventListener("click", () => {
+				applyGroupToPlayers();
+				renderGroupConfig();
+			});
+		if (btnClear && !resetDisabled)
+			btnClear.addEventListener("click", () => {
+				clearGroupFromPlayers();
+				renderGroupConfig();
+			});
+		if (btnSelectAll)
+			btnSelectAll.addEventListener("click", () => {
+				var groupPlayers = players.filter((p) => getPosGroup(p) === activeTab);
+				var eligible = groupPlayers.filter((p) => {
+					if (
+						getAcademyGoldCount(p) >= MAX_GOLD &&
+						getAcademySilverCount(p) >= MAX_SILVER
+					)
+						return false;
+					if (isCardLocked(p)) return false;
+					return true;
+				});
+				// Toggle: if all eligible are selected, deselect all; otherwise select all
+				var allSelected = eligible.every((p) => selPlayers.has(p.id));
+				if (allSelected) {
+					groupPlayers.forEach((p) => {
+						selPlayers.delete(p.id);
+					});
+					log(
+						"已取消全选 " +
+							activeTab +
+							" 分组 (" +
+							groupPlayers.length +
+							" 人)",
+						"info",
+					);
+				} else {
+					// Select eligible players, but only one per resourceId for unevolved cards
+					var seenRid = {};
+					eligible.forEach((p) => {
+						if (hasExistingEvo(p)) {
+							selPlayers.add(p.id);
+							return;
+						}
+						if (seenRid[p.resourceId]) return; // Already selected one of this card
+						seenRid[p.resourceId] = true;
+						selPlayers.add(p.id);
+					});
+					var added = eligible.filter((p) => selPlayers.has(p.id)).length;
+					log(
+						"已全选 " +
+							activeTab +
+							" 分组球员 (" +
+							added +
+							"/" +
+							groupPlayers.length +
+							" 人)",
+						"info",
+					);
+				}
+				saveConfigToStorage();
+				renderPlayerList();
+				renderSummary();
+				renderGroupConfig();
+			});
+	}
+
+	function renderPlayerList() {
+		var el = $("fc-batch-player-list");
+		if (!el) return;
+		var q = (
+			($("fc-batch-search-group") && $("fc-batch-search-group").value) ||
+			""
+		).toLowerCase();
+
+		var groupPlayers = players.filter((p) => {
+			if (q && p.name && p.name.toLowerCase().indexOf(q) === -1) return false;
+			return getPosGroup(p) === activeTab;
+		});
+
+		if (hideCompleted) {
+			groupPlayers = groupPlayers.filter((p) => {
+				var full =
+					getAcademyGoldCount(p) >= MAX_GOLD &&
+					getAcademySilverCount(p) >= MAX_SILVER;
+				if (full) return false;
+				if (isCardLocked(p)) return false;
+				return true;
+			});
+		}
+
+		if (groupPlayers.length === 0) {
+			el.innerHTML = '<div class="fc-empty">该分组暂无球员</div>';
+			return;
+		}
+
+		var h = "";
+		groupPlayers.forEach((p, idx) => {
+			var ck = selPlayers.has(p.id);
+			var pGold = playerGoldPs[p.id] || [];
+			var pSilver = playerSilverPs[p.id] || [];
+			var existingGold = getAcademyGoldCount(p);
+			var existingSilver = getAcademySilverCount(p);
+			var isCompleted =
+				existingGold >= MAX_GOLD && existingSilver >= MAX_SILVER;
+			var locked = isCardLocked(p);
+			var dupBlocked = !locked && !isCompleted && isCardDupBlocked(p);
+			var canSelect = !isCompleted && !locked && !dupBlocked;
+
+			var displayName = p.name || "#" + (p.resourceId || "?");
+			var cardCls = "fc-player-card";
+			if (ck) cardCls += " selected";
+			if (isCompleted) cardCls += " completed";
+			if (locked) cardCls += " locked-card";
+			if (dupBlocked) cardCls += " dup-blocked";
+			var lockTitle = locked ? ' title="另一张同名卡已进化，不可再选"' : "";
+			var dupTitle = dupBlocked
+				? ' title="同名卡已选中一张，不可同时进化多张"'
+				: "";
+			h +=
+				'<div class="' +
+				cardCls +
+				'" data-pid="' +
+				p.id +
+				'" data-cansel="' +
+				(canSelect ? "1" : "0") +
+				'"' +
+				lockTitle +
+				dupTitle +
+				">";
+
+			// Row 1: checkbox + EA card view slot + name + rating + position
+			h += '<div class="fc-player-main">';
+			var chkCls = "fc-chk-box";
+			if (!canSelect) chkCls += " fc-chk-disabled";
+			if (isCompleted) chkCls += " fc-chk-completed";
+			var chkText = "";
+			if (isCompleted) chkText = "✓";
+			else if (locked) chkText = "🔒";
+			else if (dupBlocked) chkText = "⊘";
+			else if (ck) chkText = "✓";
+			h += '<span class="' + chkCls + '">' + chkText + "</span>";
+
+			// Card slot for EA native card view (populated by _renderCardViews after innerHTML)
+			h += '<div class="fc-card-slot" data-pidx="' + idx + '"></div>';
+
+			h += '<span class="fc-player-name">' + esc(displayName) + "</span>";
+			h += '<span class="fc-player-rating">' + (p.rating || "?") + "</span>";
+			h += '<span class="fc-player-pos">' + (p.position || "?") + "</span>";
+			h += "</div>";
+
+			// Row 2: per-player gold + silver dropdowns
+			h += '<div class="fc-player-dd-row">';
+			h +=
+				'<button class="fc-dd-trigger fc-dd-trigger-sm" data-dd="player-' +
+				p.id +
+				'-gold">' +
+				"金 (" +
+				(existingGold + pGold.length) +
+				"/" +
+				MAX_GOLD +
+				") ▼</button>";
+			h +=
+				'<button class="fc-dd-trigger fc-dd-trigger-sm" data-dd="player-' +
+				p.id +
+				'-silver">' +
+				"银 (" +
+				(existingSilver + pSilver.length) +
+				"/" +
+				MAX_SILVER +
+				") ▼</button>";
+			h += "</div>";
+
+			// Row 3: trait icons — show PNG icon, fallback to Chinese name on error
+			h += '<div class="fc-player-traits">';
+			var dispTraits = traitSource(p);
+			if (dispTraits.length > 0) {
+				dispTraits.forEach((a) => {
+					if (a.id < 100) return; // Skip non-playstyle attributes (SM, WF, etc.)
+					var isGold = a.totalBonus === 2;
+					var s = slotByTraitId(a.id);
+					var label = s ? traitDisplayName(s.slotName, isGold) : "ID:" + a.id;
+					var prefix = isGold ? "icontrait" : "basetrait";
+					var iconId = traitIconId(a.id);
+					h +=
+						'<img class="fc-trait-icon" src="' +
+						_traitIconBase +
+						prefix +
+						iconId +
+						'.png" title="' +
+						esc(label) +
+						'" data-fc-name="' +
+						esc(label) +
+						'" data-fc-gold="' +
+						(isGold ? "1" : "0") +
+						'" onerror="_fcTraitImgErr(this)">';
+				});
+			}
+			pGold.forEach((sid) => {
+				var s = slotById(sid);
+				var traitId = s ? s.traitId : null;
+				if (traitId != null) {
+					var label = s ? traitDisplayName(s.slotName, true) : "ID:" + traitId;
+					h +=
+						'<img class="fc-trait-icon planned" src="' +
+						_traitIconBase +
+						"icontrait" +
+						traitIconId(traitId) +
+						'.png" title="' +
+						esc(label) +
+						'" data-fc-name="' +
+						esc(label) +
+						'" data-fc-gold="1" onerror="_fcTraitImgErr(this)">';
+				}
+			});
+			pSilver.forEach((sid) => {
+				var s = slotById(sid);
+				var traitId = s ? s.traitId : null;
+				if (traitId != null) {
+					var label = s ? s.slotName : "ID:" + traitId;
+					h +=
+						'<img class="fc-trait-icon planned" src="' +
+						_traitIconBase +
+						"basetrait" +
+						traitIconId(traitId) +
+						'.png" title="' +
+						esc(label) +
+						'" data-fc-name="' +
+						esc(label) +
+						'" data-fc-gold="0" onerror="_fcTraitImgErr(this)">';
+				}
+			});
+			h += "</div></div>";
+		});
+		el.innerHTML = h;
+
+		// Render EA native card views into slots
+		_renderCardViews(el, groupPlayers);
+	}
+
+	// Render EA-native player card views using UTItemViewFactory.
+	// Uses the same lifecycle as FCEnhancer: init → renderRestrictions=true → render(item, false).
+	var _cardViewCache = {}; // playerId → view (for destroy/reuse)
+
+	function _renderCardViews(container, groupPlayers) {
+		try {
+			var uw = unsafeWindow;
+			var factory = uw.UTItemViewFactory;
+			if (!factory || typeof factory.createSmallItem !== "function") {
+				_renderCardPlaceholders(container, groupPlayers);
+				return;
+			}
+		} catch (e) {
+			_renderCardPlaceholders(container, groupPlayers);
+			return;
+		}
+
+		var rendered = 0,
+			placeholders = 0;
+
+		for (var i = 0; i < groupPlayers.length; i++) {
+			var p = groupPlayers[i];
+			var slot = container.querySelector(
+				'.fc-card-slot[data-pidx="' + i + '"]',
+			);
+			if (!slot) continue;
+
+			// Reuse cached view if available
+			if (_cardViewCache[p.id]) {
+				var cachedView = _cardViewCache[p.id];
+				try {
+					var cachedRoot = cachedView.getRootElement();
+					if (cachedRoot) {
+						slot.innerHTML = "";
+						slot.appendChild(cachedRoot);
+						rendered++;
+						continue;
+					}
+				} catch (e) {}
+				delete _cardViewCache[p.id];
+			}
+
+			// Create EA-native card view
+			try {
+				var itemData = p._raw || p;
+				var view = factory.createSmallItem(itemData);
+				if (!view) {
+					_renderCardPlaceholder(slot, p);
+					placeholders++;
+					continue;
+				}
+
+				// FCEnhancer lifecycle
+				view.init();
+				view.renderRestrictions = true;
+				view.render(itemData, false);
+
+				// Hook renderComplete to know when canvas is ready
+				var originalComplete = view.renderComplete;
+				view.renderComplete = function () {
+					if (originalComplete) originalComplete.apply(this, arguments);
+					// Canvas is now rendered — mark for later verification
+					view._fcRendered = true;
+				};
+
+				// Get root element and insert into slot
+				var rootEl = view.getRootElement();
+				if (rootEl) {
+					_cardViewCache[p.id] = view;
+					slot.innerHTML = "";
+					slot.appendChild(rootEl);
+					rendered++;
+				} else {
+					_renderCardPlaceholder(slot, p);
+					placeholders++;
+				}
+			} catch (e) {
+				_renderCardPlaceholder(slot, p);
+				placeholders++;
+			}
+		}
+
+		if (rendered + placeholders > 0) {
+		}
+	}
+
+	// Cleanup card view cache
+	function _clearCardViewCache() {
+		Object.keys(_cardViewCache).forEach((k) => {
+			delete _cardViewCache[k];
+		});
+	}
+
+	function _renderCardPlaceholders(container, groupPlayers) {
+		var slots = container.querySelectorAll(".fc-card-slot");
+		for (var i = 0; i < slots.length; i++) {
+			var p = groupPlayers[parseInt(slots[i].dataset.pidx)];
+			if (p) _renderCardPlaceholder(slots[i], p);
+		}
+	}
+
+	function _renderCardPlaceholder(slot, p) {
+		var rc =
+			p.rating >= 94
+				? "#f59e0b"
+				: p.rating >= 88
+					? "#1d4ed8"
+					: p.rating >= 82
+						? "#22c55e"
+						: "#888";
+		slot.innerHTML =
+			'<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;height:100%;background:linear-gradient(135deg,' +
+			rc +
+			"33," +
+			rc +
+			'11);border-radius:6px;border:1px solid rgba(255,255,255,0.06);">' +
+			'<span style="font-size:20px;font-weight:800;color:' +
+			rc +
+			'">' +
+			(p.rating || "?") +
+			"</span>" +
+			'<span style="font-size:8px;font-weight:600;color:' +
+			rc +
+			';opacity:0.7">' +
+			(p.position || "?") +
+			"</span></div>";
+	}
+
+	function renderSummary() {
+		var el = $("fc-batch-summary");
+		if (!el) return;
+		var totalEvo = 0;
+		selPlayers.forEach((pid) => {
+			var effective = getEffectiveSlots(pid);
+			totalEvo += effective.gold.length + effective.silver.length;
+		});
+		el.innerHTML =
+			"已选 <strong>" +
+			selPlayers.size +
+			"</strong> 球员, 总计 <strong>" +
+			totalEvo +
+			"</strong> 次进化" +
+			(totalEvo === 0 && selPlayers.size > 0
+				? ' <span style="color:#f87171">(请使用「应用到当前分组」配置球员特技)</span>'
+				: "");
+		updateBtns();
+	}
+
+	function renderLogs() {
+		var el = $("fc-batch-logs");
+		if (!el) return;
+		var h = "";
+		var start = Math.max(0, logs.length - 100);
+		for (var i = start; i < logs.length; i++) {
+			var l = logs[i];
+			var cls =
+				l.type === "ok"
+					? "ok"
+					: l.type === "err"
+						? "err"
+						: l.type === "warn"
+							? "warn"
+							: "info";
+			h +=
+				'<div class="fc-log-' +
+				cls +
+				'">' +
+				l.time +
+				"  " +
+				esc(l.msg) +
+				"</div>";
+		}
+		el.innerHTML = h;
+		el.scrollTop = el.scrollHeight;
+	}
+
+	function renderProgress() {
+		var el = $("fc-batch-progress");
+		if (!el) return;
+		if (queue.length === 0) {
+			el.innerHTML = "";
+			return;
+		}
+		var t = queue.length,
+			d = qi,
+			pct = t > 0 ? Math.round((d / t) * 100) : 0;
+		el.innerHTML =
+			'<div class="fc-pbar"><div class="fc-pfill" style="width:' +
+			pct +
+			'%"></div></div>' +
+			'<span class="fc-ptext">' +
+			d +
+			"/" +
+			t +
+			" (" +
+			pct +
+			"%)</span>";
+	}
+
+	// ═══════════════ EVENT DELEGATION ═══════════════
+	function delegate(id, selector, handler) {
+		var el = $(id);
+		if (!el) return;
+		el.addEventListener("click", (e) => {
+			var t = e.target.closest(selector);
+			if (t && el.contains(t)) handler(t, e);
+		});
+	}
+
+	// ═══════════════ PERSISTENCE ═══════════════
+	function saveConfigToStorage() {
+		var config = {
+			groupGoldPs: groupGoldPs,
+			groupSilverPs: groupSilverPs,
+			playerGoldPs: playerGoldPs,
+			playerSilverPs: playerSilverPs,
+			selRarities: Array.from(selRarities),
+			hideCompleted: hideCompleted,
+			selPlayers: Array.from(selPlayers),
+			groupApplied: groupApplied,
+		};
+		GM_setValue("fc-evo-batch-config", JSON.stringify(config));
+	}
+
+	function saveConfig() {
+		saveConfigToStorage();
+		var config = {
+			groupGoldPs: groupGoldPs,
+			groupSilverPs: groupSilverPs,
+			playerGoldPs: playerGoldPs,
+			playerSilverPs: playerSilverPs,
+			selRarities: Array.from(selRarities),
+			hideCompleted: hideCompleted,
+			selPlayers: Array.from(selPlayers),
+			timestamp: new Date().toISOString(),
+		};
+		var blob = new Blob([JSON.stringify(config, null, 2)], {
+			type: "application/json",
+		});
+		var a = document.createElement("a");
+		a.href = URL.createObjectURL(blob);
+		a.download =
+			"fc_evo_batch_config_" + new Date().toISOString().slice(0, 10) + ".json";
+		a.click();
+		URL.revokeObjectURL(a.href);
+		log("配置已导出 (分组模板 + 球员配置)", "ok");
+	}
+
+	function loadConfig(file) {
+		var reader = new FileReader();
+		reader.onload = (e) => {
+			try {
+				var c = JSON.parse(e.target.result);
+				groupGoldPs = c.groupGoldPs || {};
+				groupSilverPs = c.groupSilverPs || {};
+				playerGoldPs = c.playerGoldPs || {};
+				playerSilverPs = c.playerSilverPs || {};
+				if (c.selRarities) selRarities = new Set(c.selRarities);
+				hideCompleted = Object.hasOwn(c, "hideCompleted")
+					? c.hideCompleted
+					: true;
+				if (c.selPlayers) selPlayers = new Set(c.selPlayers);
+				saveConfigToStorage();
+				renderRarityFilter();
+				renderGroupConfig();
+				renderPlayerList();
+				renderSummary();
+				log("配置已加载", "ok");
+			} catch (err) {
+				log("配置加载失败: " + err.message, "err");
+			}
+		};
+		reader.readAsText(file);
+	}
+
+	function loadConfigFromStorage() {
+		try {
+			var raw = GM_getValue("fc-evo-batch-config", "");
+			if (!raw) return;
+			var c = JSON.parse(raw);
+			groupGoldPs = c.groupGoldPs || {};
+			groupSilverPs = c.groupSilverPs || {};
+			playerGoldPs = c.playerGoldPs || {};
+			playerSilverPs = c.playerSilverPs || {};
+			if (c.selRarities && c.selRarities.length > 0)
+				selRarities = new Set(c.selRarities);
+			hideCompleted = Object.hasOwn(c, "hideCompleted")
+				? c.hideCompleted
+				: true;
+			if (c.selPlayers && c.selPlayers.length > 0)
+				selPlayers = new Set(c.selPlayers);
+			groupApplied = c.groupApplied || {};
+		} catch (e) {}
+	}
+
+	// ═══════════════ PANEL BUILD ═══════════════
+	function build() {
+		if (document.getElementById("fc-batch-style")) return;
+
+		initPosCodeMap();
+		loadConfigFromStorage();
+
+		_traitIconBase = "images/traits/bio/";
+
+		// Register trait icon error fallback — shows Chinese name when PNG not available
+		unsafeWindow._fcTraitImgErr = (img) => {
+			var name = img.getAttribute("data-fc-name") || "?";
+			var isGold = img.getAttribute("data-fc-gold") === "1";
+			var cls = isGold ? "fc-tag gold" : "fc-tag silver";
+			img.outerHTML =
+				'<span class="' +
+				cls +
+				'" style="font-size:10px;line-height:1.4">' +
+				name +
+				"</span>";
+		};
+
+		var style = document.createElement("style");
+		style.id = "fc-batch-style";
+		style.textContent =
+			"\
 #fc-batch-overlay{position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483646;background:rgba(0,0,0,0.85);display:none;align-items:center;justify-content:center;}\
 #fc-batch-overlay.show{display:flex;}\
 #fc-batch-panel{position:relative;width:1100px;max-width:97vw;height:720px;max-height:94vh;background:linear-gradient(180deg,#0f0f23,#1a1a2e);border-radius:12px;display:flex;flex-direction:column;font-family:Arial,sans-serif;font-size:13px;color:#e0e0e0;box-shadow:0 0 60px rgba(59,130,246,0.3),0 8px 40px rgba(0,0,0,0.6);overflow:hidden;border:1px solid rgba(59,130,246,0.25);}\
@@ -1862,11 +2715,13 @@
 .fc-dd-name{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}\
 .fc-dd-empty{text-align:center;color:#555;padding:16px;font-size:11px;}\
 ";
-        document.head.appendChild(style);
+		document.head.appendChild(style);
 
-        // Overlay
-        var ov = document.createElement("div"); ov.id = "fc-batch-overlay";
-        ov.innerHTML = '\
+		// Overlay
+		var ov = document.createElement("div");
+		ov.id = "fc-batch-overlay";
+		ov.innerHTML =
+			'\
 <div id="fc-batch-panel">\
 <div id="fc-batch-loading"><div class="fc-spinner"></div><div class="fc-loading-text">数据加载中...</div></div>\
 <div id="fc-batch-header">\
@@ -1894,208 +2749,238 @@
 </div>\
 <div id="fc-batch-logs"><div style="color:#555">日志 — 脚本已加载，打开面板将自动拉取数据</div></div>\
 </div></div>';
-        document.body.appendChild(ov);
+		document.body.appendChild(ov);
 
-        // Dropdown panel (shared, appended to body for fixed positioning)
-        var dd = document.createElement("div"); dd.id = "fc-dd"; dd.className = "fc-dropdown";
-        document.body.appendChild(dd);
+		// Dropdown panel (shared, appended to body for fixed positioning)
+		var dd = document.createElement("div");
+		dd.id = "fc-dd";
+		dd.className = "fc-dropdown";
+		document.body.appendChild(dd);
 
-        // ── Static bindings ──
-        $("fc-batch-close").addEventListener("click", function () { ov.classList.remove("show"); });
-        $("fc-chip-hide-completed").addEventListener("click", function () {
-            hideCompleted = !hideCompleted;
-            saveConfigToStorage();
-            renderRarityFilter();
-            renderPlayerList();
-            renderSummary();
-        });
-        $("fc-batch-btn-start").addEventListener("click", function () { running ? stopExec() : startExec(); });
-        $("fc-batch-btn-copylog").addEventListener("click", function () {
-            var text = logs.map(function (l) { return l.time + "  " + l.msg; }).join("\n");
-            navigator.clipboard.writeText(text).then(function () { log("已复制", "ok"); });
-        });
+		// ── Static bindings ──
+		$("fc-batch-close").addEventListener("click", () => {
+			ov.classList.remove("show");
+		});
+		$("fc-chip-hide-completed").addEventListener("click", () => {
+			hideCompleted = !hideCompleted;
+			saveConfigToStorage();
+			renderRarityFilter();
+			renderPlayerList();
+			renderSummary();
+		});
+		$("fc-batch-btn-start").addEventListener("click", () => {
+			running ? stopExec() : startExec();
+		});
+		$("fc-batch-btn-copylog").addEventListener("click", () => {
+			var text = logs.map((l) => l.time + "  " + l.msg).join("\n");
+			navigator.clipboard.writeText(text).then(() => {
+				log("已复制", "ok");
+			});
+		});
 
-        // ── Close dropdown on outside click ──
-        document.addEventListener("click", function (e) {
-            if (!ddOpen) return;
-            var trigger = e.target.closest(".fc-dd-trigger");
-            var rarityBtn = e.target.closest(".fc-rarity-btn");
-            var panel = e.target.closest("#fc-dd");
-            if (!trigger && !rarityBtn && !panel) closeDropdown();
-        });
+		// ── Close dropdown on outside click ──
+		document.addEventListener("click", (e) => {
+			if (!ddOpen) return;
+			var trigger = e.target.closest(".fc-dd-trigger");
+			var rarityBtn = e.target.closest(".fc-rarity-btn");
+			var panel = e.target.closest("#fc-dd");
+			if (!trigger && !rarityBtn && !panel) closeDropdown();
+		});
 
-        // ── Dropdown trigger click (global delegation) ──
-        document.addEventListener("click", function (e) {
-            var trigger = e.target.closest(".fc-dd-trigger");
-            if (!trigger) return;
-            e.stopPropagation();
-            var type = trigger.getAttribute("data-dd");
-            if (!type) return;
+		// ── Dropdown trigger click (global delegation) ──
+		document.addEventListener("click", (e) => {
+			var trigger = e.target.closest(".fc-dd-trigger");
+			if (!trigger) return;
+			e.stopPropagation();
+			var type = trigger.getAttribute("data-dd");
+			if (!type) return;
 
-            // Remove active from all triggers
-            var allTriggers = document.querySelectorAll(".fc-dd-trigger");
-            allTriggers.forEach(function (t) { t.classList.remove("active"); });
+			// Remove active from all triggers
+			var allTriggers = document.querySelectorAll(".fc-dd-trigger");
+			allTriggers.forEach((t) => {
+				t.classList.remove("active");
+			});
 
-            if (ddOpen && ddType === type) {
-                closeDropdown();
-                return;
-            }
+			if (ddOpen && ddType === type) {
+				closeDropdown();
+				return;
+			}
 
-            trigger.classList.add("active");
-            openDropdown(type);
-        });
+			trigger.classList.add("active");
+			openDropdown(type);
+		});
 
-        // ── Dropdown item click ──
-        dd.addEventListener("click", function (e) {
-            var item = e.target.closest(".fc-dd-item");
-            if (!item) return;
-            e.stopPropagation(); // 防止 renderDropdown 重写 innerHTML 后事件冒泡触发关闭
-            var sid = parseInt(item.getAttribute("data-sid"));
-            if (isNaN(sid)) return;
-            handleDropdownClick(sid);
-        });
+		// ── Dropdown item click ──
+		dd.addEventListener("click", (e) => {
+			var item = e.target.closest(".fc-dd-item");
+			if (!item) return;
+			e.stopPropagation(); // 防止 renderDropdown 重写 innerHTML 后事件冒泡触发关闭
+			var sid = parseInt(item.getAttribute("data-sid"));
+			if (isNaN(sid)) return;
+			handleDropdownClick(sid);
+		});
 
-        // ── Event delegation within panel ──
-        var rarityBtn = $("fc-rarity-btn");
-        if (rarityBtn) {
-            rarityBtn.addEventListener("click", function (e) {
-                e.stopPropagation();
-                if (ddOpen && ddType === "rarity") { closeDropdown(); return; }
-                openRarityDropdown();
-            });
-        }
+		// ── Event delegation within panel ──
+		var rarityBtn = $("fc-rarity-btn");
+		if (rarityBtn) {
+			rarityBtn.addEventListener("click", (e) => {
+				e.stopPropagation();
+				if (ddOpen && ddType === "rarity") {
+					closeDropdown();
+					return;
+				}
+				openRarityDropdown();
+			});
+		}
 
-        // Handle rarity dropdown item clicks
-        var ddEl = $("fc-dd");
-        if (ddEl) {
-            ddEl.addEventListener("click", function (e) {
-                var item = e.target.closest(".fc-rarity-item[data-rk]");
-                if (!item) return;
-                e.stopPropagation();
-                handleRarityClick(item.getAttribute("data-rk"));
-            });
-        }
+		// Handle rarity dropdown item clicks
+		var ddEl = $("fc-dd");
+		if (ddEl) {
+			ddEl.addEventListener("click", (e) => {
+				var item = e.target.closest(".fc-rarity-item[data-rk]");
+				if (!item) return;
+				e.stopPropagation();
+				handleRarityClick(item.getAttribute("data-rk"));
+			});
+		}
 
-        delegate("fc-batch-tabs", ".fc-tab", function (el) {
-            activeTab = el.getAttribute("data-tab");
-            closeDropdown();
-            renderTabs();
-            renderGroupConfig();
-            renderPlayerList();
-        });
+		delegate("fc-batch-tabs", ".fc-tab", (el) => {
+			activeTab = el.getAttribute("data-tab");
+			closeDropdown();
+			renderTabs();
+			renderGroupConfig();
+			renderPlayerList();
+		});
 
-        delegate("fc-batch-player-list", ".fc-player-card", function (el) {
-            if (el.getAttribute("data-cansel") === "0") return; // Skip locked/blocked/completed
-            var pid = parseInt(el.getAttribute("data-pid"));
-            if (isNaN(pid)) return;
-            if (selPlayers.has(pid)) { selPlayers.delete(pid); }
-            else {
-                // Deselect other duplicates of the same card (same resourceId)
-                var p = null;
-                for (var i = 0; i < players.length; i++) { if (players[i].id === pid) { p = players[i]; break; } }
-                if (p && !hasExistingEvo(p)) {
-                    var same = sameCardGroup(p);
-                    same.forEach(function (sp) { if (sp.id !== pid) selPlayers.delete(sp.id); });
-                }
-                selPlayers.add(pid);
-            }
-            saveConfigToStorage();
-            renderPlayerList();
-            renderSummary();
-        });
+		delegate("fc-batch-player-list", ".fc-player-card", (el) => {
+			if (el.getAttribute("data-cansel") === "0") return; // Skip locked/blocked/completed
+			var pid = parseInt(el.getAttribute("data-pid"));
+			if (isNaN(pid)) return;
+			if (selPlayers.has(pid)) {
+				selPlayers.delete(pid);
+			} else {
+				// Deselect other duplicates of the same card (same resourceId)
+				var p = null;
+				for (var i = 0; i < players.length; i++) {
+					if (players[i].id === pid) {
+						p = players[i];
+						break;
+					}
+				}
+				if (p && !hasExistingEvo(p)) {
+					var same = sameCardGroup(p);
+					same.forEach((sp) => {
+						if (sp.id !== pid) selPlayers.delete(sp.id);
+					});
+				}
+				selPlayers.add(pid);
+			}
+			saveConfigToStorage();
+			renderPlayerList();
+			renderSummary();
+		});
 
-        renderRarityFilter();
-        renderTabs();
-        renderGroupConfig();
-        renderSummary();
+		renderRarityFilter();
+		renderTabs();
+		renderGroupConfig();
+		renderSummary();
 
-        log("FutKit-批量进化工具 已就绪", "ok");
+		log("FutKit-批量进化工具 已就绪", "ok");
 
-        // 匿名统计上报
-        (function () {
-            try {
-                var uid = GM_getValue("fc-evo-uid");
-                if (!uid) { uid = crypto.randomUUID(); GM_setValue("fc-evo-uid", uid); }
-                var ver = (typeof GM_info !== "undefined" && GM_info.script && GM_info.script.version) || "?";
-                fetch("https://fc-stats.polarspark.workers.dev/ping", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ u: uid, v: ver, n: "evo_batch" })
-                }).catch(function () {});
-            } catch (e) {}
-        })();
+		// 匿名统计上报
+		(() => {
+			try {
+				var uid = GM_getValue("fc-evo-uid");
+				if (!uid) {
+					uid = crypto.randomUUID();
+					GM_setValue("fc-evo-uid", uid);
+				}
+				var ver =
+					(typeof GM_info !== "undefined" &&
+						GM_info.script &&
+						GM_info.script.version) ||
+					"?";
+				fetch("https://fc-stats.polarspark.workers.dev/ping", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ u: uid, v: ver, n: "evo_batch" }),
+				}).catch(() => {});
+			} catch (e) {}
+		})();
 
-        // ── 注入 Academy 页面按钮 ──
-        injectAcademyButton();
-    }
+		// ── 注入 Academy 页面按钮 ──
+		injectAcademyButton();
+	}
 
-    function injectAcademyButton() {
-        function tryInject() {
-            // Already injected
-            if (document.getElementById("fc-academy-btn")) return;
+	function injectAcademyButton() {
+		function tryInject() {
+			// Already injected
+			if (document.getElementById("fc-academy-btn")) return;
 
-            // Find the academy hub list container
-            var listEl = document.querySelector('[class*="ut-academy-hub-view--list"]');
-            if (!listEl) return;
+			// Find the academy hub list container
+			var listEl = document.querySelector(
+				'[class*="ut-academy-hub-view--list"]',
+			);
+			if (!listEl) return;
 
-            // Create wrapper at the bottom-right of the list
-            var insertParent = document.createElement("div");
-            insertParent.style.cssText = "display:flex;justify-content:flex-end;width:100%;margin:12px 0;";
-            listEl.appendChild(insertParent);
+			// Create wrapper at the bottom-right of the list
+			var insertParent = document.createElement("div");
+			insertParent.style.cssText =
+				"display:flex;justify-content:flex-end;width:100%;margin:12px 0;";
+			listEl.appendChild(insertParent);
 
-            // Create the button with all-inline styles (no dependency on external CSS)
-            var ourBtn = document.createElement("button");
-            ourBtn.id = "fc-academy-btn";
-            ourBtn.type = "button";
-            ourBtn.textContent = "批量进化工具";
-            ourBtn.style.cssText =
-                "display:inline-flex;align-items:center;justify-content:center;" +
-                "height:32px;padding:0 16px;border:none;border-radius:8px;" +
-                "background:linear-gradient(135deg,#3b82f6,#06b6d4);color:#fff;" +
-                "font-size:13px;font-weight:600;white-space:nowrap;cursor:pointer;" +
-                "box-shadow:0 2px 8px rgba(59,130,246,0.3);" +
-                "transition:transform 0.15s,box-shadow 0.15s;" +
-                "-webkit-tap-highlight-color:transparent;" +
-                "user-select:none;outline:none;";
-            insertParent.appendChild(ourBtn);
+			// Create the button with all-inline styles (no dependency on external CSS)
+			var ourBtn = document.createElement("button");
+			ourBtn.id = "fc-academy-btn";
+			ourBtn.type = "button";
+			ourBtn.textContent = "批量进化工具";
+			ourBtn.style.cssText =
+				"display:inline-flex;align-items:center;justify-content:center;" +
+				"height:32px;padding:0 16px;border:none;border-radius:8px;" +
+				"background:linear-gradient(135deg,#3b82f6,#06b6d4);color:#fff;" +
+				"font-size:13px;font-weight:600;white-space:nowrap;cursor:pointer;" +
+				"box-shadow:0 2px 8px rgba(59,130,246,0.3);" +
+				"transition:transform 0.15s,box-shadow 0.15s;" +
+				"-webkit-tap-highlight-color:transparent;" +
+				"user-select:none;outline:none;";
+			insertParent.appendChild(ourBtn);
 
-            // Hover effect
-            ourBtn.addEventListener("mouseenter", function () {
-                ourBtn.style.transform = "translateY(-1px)";
-                ourBtn.style.boxShadow = "0 4px 14px rgba(59,130,246,0.45)";
-            });
-            ourBtn.addEventListener("mouseleave", function () {
-                ourBtn.style.transform = "";
-                ourBtn.style.boxShadow = "0 2px 8px rgba(59,130,246,0.3)";
-            });
+			// Hover effect
+			ourBtn.addEventListener("mouseenter", () => {
+				ourBtn.style.transform = "translateY(-1px)";
+				ourBtn.style.boxShadow = "0 4px 14px rgba(59,130,246,0.45)";
+			});
+			ourBtn.addEventListener("mouseleave", () => {
+				ourBtn.style.transform = "";
+				ourBtn.style.boxShadow = "0 2px 8px rgba(59,130,246,0.3)";
+			});
 
-            // Click/tap handler
-            function openTool() {
-                var ov = $("fc-batch-overlay");
-                if (ov) {
-                    ov.classList.toggle("show");
-                    if (ov.classList.contains("show") && !dataLoaded) {
-                        setTimeout(doFullDataLoad, 300);
-                    }
-                }
-            }
-            ourBtn.addEventListener("click", openTool);
-            ourBtn.addEventListener("touchend", function (e) {
-                e.preventDefault();
-                openTool();
-            });
+			// Click/tap handler
+			function openTool() {
+				var ov = $("fc-batch-overlay");
+				if (ov) {
+					ov.classList.toggle("show");
+					if (ov.classList.contains("show") && !dataLoaded) {
+						setTimeout(doFullDataLoad, 300);
+					}
+				}
+			}
+			ourBtn.addEventListener("click", openTool);
+			ourBtn.addEventListener("touchend", (e) => {
+				e.preventDefault();
+				openTool();
+			});
+		}
 
-        }
+		// Try immediately
+		tryInject();
 
-        // Try immediately
-        tryInject();
+		// Watch for DOM changes (SPA navigation)
+		var observer = new MutationObserver(() => {
+			tryInject();
+		});
+		observer.observe(document.body, { childList: true, subtree: true });
+	}
 
-        // Watch for DOM changes (SPA navigation)
-        var observer = new MutationObserver(function () {
-            tryInject();
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-    }
-
-    setTimeout(build, 500);
+	setTimeout(build, 500);
 })();
